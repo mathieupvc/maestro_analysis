@@ -1,0 +1,31 @@
+---
+title: "dual_mechanism_model"
+output: html_document
+date: "2025-11-14"
+---
+
+Library loading
+```{r}
+library(lme4)
+```
+
+Data loading
+```{r}
+df <- read.csv("~/These/data/meg_maestro/representation_analysis/seeg/corr_and_distance/dual_mechanism_data.csv")
+
+# Make subject a factor
+df$subject <- factor(df$subject)
+```
+
+glmm
+```{r}
+model <- glmer(
+  correct ~ predicted_similarity + predicted_separability + (1 | subject),
+  data = df,
+  family = binomial(link = "logit"),
+  #control = glmerControl(optimizer = "bobyqa")  # usually more stable
+)
+
+summary(model)
+```
+

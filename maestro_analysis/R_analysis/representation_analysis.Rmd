@@ -1,0 +1,164 @@
+---
+title: "representation_analysis"
+output: html_document
+date: "2025-01-29"
+---
+
+### Libraries
+```{r}
+library(tidyverse)
+library(car)
+library(lme4)
+library(nlme)
+library(DHARMa)
+library(rgl)
+library(remef)
+```
+
+### Load data and create factors
+```{r}
+# intrastim_correlation = read.csv("~/These/data/meg_maestro/representation_analysis/seeg/csv_correlations/similarity_matrix_medial_temporal_similarity.csv")
+# intrastim_correlation = read.csv("~/These/data/meg_maestro/representation_analysis/seeg/csv_correlations/similarity_matrix_hippocampus_similarity.csv")
+intrastim_correlation = read.csv("~/These/data/meg_maestro/representation_analysis/seeg/csv_correlations/similarity_matrix_channels_Left-Hippocampus_similarity.csv")
+intrastim_correlation$onset = as.factor(intrastim_correlation$onset)
+intrastim_correlation$rate = as.factor(intrastim_correlation$rate)
+```
+
+### Visualizations
+```{r}
+# scatterplotMatrix(~correct + correlation + onset + rate + surprise, data=intrastim_correlation)
+hist(intrastim_correlation$correct)
+hist(intrastim_correlation$correlation)
+hist(intrastim_correlation$surprise)
+hist(intrastim_correlation$positive_surprise)
+```
+
+### intrastim correlation and correct
+The first three lines assess whether random effects are needed
+```{r}
+correct = glmer(correct ~ correlation + (1|subject), data = intrastim_correlation, family = binomial(link='logit'))
+AIC(correct)
+correct = glmer(correct ~ correlation + rate + (1|subject), data = intrastim_correlation, family = binomial(link='logit'))
+AIC(correct)
+correct = glmer(correct ~ correlation + onset + (1|subject), data = intrastim_correlation, family = binomial(link='logit'))
+AIC(correct)
+correct = glmer(correct ~ correlation + onset + rate + (1|subject), data = intrastim_correlation, family = binomial(link='logit'))
+AIC(correct)
+correct = glmer(correct ~ correlation + onset + rate + (1|subject) + (1 | subject:channel), data = intrastim_correlation, family = binomial(link='logit'))
+AIC(correct)
+
+correct = glmer(correct ~ correlation + onset + rate + (1|subject), data = intrastim_correlation, family = binomial(link='logit'))
+summary(correct)
+```
+
+### surprise and intrastim correlation
+The first three lines assess whether random effects are needed
+```{r}
+library(lmerTest)
+
+correct = lmer(correlation ~ surprise + (1|subject), data = intrastim_correlation)
+AIC(correct)
+correct = lmer(correlation ~ surprise + onset + (1|subject), data = intrastim_correlation)
+AIC(correct)
+correct = lmer(correlation ~ surprise + rate + (1|subject), data = intrastim_correlation)
+AIC(correct)
+correct = lmer(correlation ~ surprise + onset + rate + (1|subject), data = intrastim_correlation)
+AIC(correct)
+correct = lmer(correlation ~ surprise + onset + rate + (1|subject) + (1 | subject:channel), data = intrastim_correlation)
+AIC(correct)
+
+correct = lmer(correlation ~ surprise + onset + rate + (1|subject), data = intrastim_correlation)
+summary(correct)
+correct = lmer(correlation ~ surprise + onset + rate + (1|subject) + (1 | subject:channel), data = intrastim_correlation)
+summary(correct)
+
+
+# correct = lmer(correlation ~ positive_surprise + (1|subject), data = intrastim_correlation)
+# AIC(correct)
+# correct = lmer(correlation ~ positive_surprise + onset + (1|subject), data = intrastim_correlation)
+# AIC(correct)
+# correct = lmer(correlation ~ positive_surprise + rate + (1|subject), data = intrastim_correlation)
+# AIC(correct)
+# correct = lmer(correlation ~ positive_surprise + onset + rate + (1|subject), data = intrastim_correlation)
+# AIC(correct)
+# correct = lmer(correlation ~ positive_surprise + onset + rate + (1|subject) + (1 | subject:channel), data = intrastim_correlation)
+# AIC(correct)
+# 
+# correct = lmer(correlation ~ positive_surprise + onset + rate + (1|subject), data = intrastim_correlation)
+# summary(correct)
+# correct = lmer(correlation ~ positive_surprise + onset + rate + (1|subject) + (1 | subject:channel), data = intrastim_correlation)
+# summary(correct)
+```
+
+## Interstimulus correlation
+### Load data and create factors
+```{r}
+# interstim_correlation = read.csv("~/These/data/meg_maestro/representation_analysis/seeg/csv_correlations/similarity_matrix_medial_temporal_dissimilarity.csv")
+# interstim_correlation = read.csv("~/These/data/meg_maestro/representation_analysis/seeg/csv_correlations/similarity_matrix_hippocampus_dissimilarity.csv")
+interstim_correlation = read.csv("~/These/data/meg_maestro/representation_analysis/seeg/csv_correlations/similarity_matrix_channels_Left-Hippocampus_dissimilarity.csv")
+interstim_correlation$rep = as.factor(interstim_correlation$rep)
+interstim_correlation$onset = as.factor(interstim_correlation$onset)
+interstim_correlation$rate = as.factor(interstim_correlation$rate)
+```
+
+### Visualizations
+```{r}
+# scatterplotMatrix(~correct + correlation + rep + onset + rate + surprise, data=interstim_correlation)
+hist(interstim_correlation$correct)
+hist(interstim_correlation$correlation)
+hist(interstim_correlation$surprise)
+hist(interstim_correlation$positive_surprise)
+```
+
+### intrastim correlation and correct
+The first three lines assess whether random effects are needed
+```{r}
+correct = glmer(correct ~ correlation + rep + (1|subject), data = interstim_correlation, family = binomial(link='logit'))
+AIC(correct)
+correct = glmer(correct ~ correlation + rep + onset + (1|subject), data = interstim_correlation, family = binomial(link='logit'))
+AIC(correct)
+correct = glmer(correct ~ correlation + rep + rate + (1|subject), data = interstim_correlation, family = binomial(link='logit'))
+AIC(correct)
+correct = glmer(correct ~ correlation + rep + onset + rate + (1|subject), data = interstim_correlation, family = binomial(link='logit'))
+AIC(correct)
+correct = glmer(correct ~ correlation + rep + onset + rate + (1|subject) + (1 | subject:channel), data = interstim_correlation, family = binomial(link='logit'))
+AIC(correct)
+
+correct = glmer(correct ~ correlation + rep + onset + rate + (1|subject), data = interstim_correlation, family = binomial(link='logit'))
+summary(correct)
+```
+
+### surprise and intrastim correlation
+The first three lines assess whether random effects are needed
+```{r}
+library(lmerTest)
+
+correct = lmer(correlation ~ surprise + rep + (1|subject), data = interstim_correlation)
+AIC(correct)
+correct = lmer(correlation ~ surprise + rep + onset + (1|subject), data = interstim_correlation)
+AIC(correct)
+correct = lmer(correlation ~ surprise + rep + rate + (1|subject), data = interstim_correlation)
+AIC(correct)
+correct = lmer(correlation ~ surprise + rep + onset + rate + (1|subject), data = interstim_correlation)
+AIC(correct)
+correct = lmer(correlation ~ surprise + rep + onset + rate + (1|subject) + (1 | subject:channel), data = interstim_correlation)
+AIC(correct)
+
+correct = lmer(correlation ~ surprise + rep + onset + rate + (1|subject), data = interstim_correlation)
+summary(correct)
+
+
+# correct = lmer(correlation ~ positive_surprise + rep + (1|subject), data = interstim_correlation)
+# AIC(correct)
+# correct = lmer(correlation ~ positive_surprise + rep + onset + (1|subject), data = interstim_correlation)
+# AIC(correct)
+# correct = lmer(correlation ~ positive_surprise + rep + rate + (1|subject), data = interstim_correlation)
+# AIC(correct)
+# correct = lmer(correlation ~ positive_surprise + rep + onset + rate + (1|subject), data = interstim_correlation)
+# AIC(correct)
+# correct = lmer(correlation ~ positive_surprise + rep + onset + rate + (1|subject) + (1 | subject:channel), data = interstim_correlation)
+# AIC(correct)
+# 
+# correct = lmer(correlation ~ positive_surprise + rep + onset + rate + (1|subject), data = interstim_correlation)
+# summary(correct)
+```

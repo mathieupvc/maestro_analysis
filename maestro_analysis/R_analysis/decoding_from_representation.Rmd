@@ -1,0 +1,92 @@
+---
+title: "decoding_from_representation"
+output: html_document
+date: "2025-03-03"
+---
+
+### Libraries
+```{r}
+library(tidyverse)
+library(car)
+library(lme4)
+library(nlme)
+library(DHARMa)
+library(rgl)
+library(remef)
+```
+
+### Load data and create factors
+```{r}
+representation_data = read.csv("~/These/data/meg_maestro/representation_analysis/seeg/corr_and_distance/representation_decoding.csv")
+representation_data$subject = as.factor(representation_data$subject)
+representation_data$electrode = as.factor(representation_data$electrode)
+```
+
+### Visulizations
+```{r}
+scatterplotMatrix(~correct+surprise+intrastim_corr+interstim_dist, data=representation_data)
+scatterplot(correct~surprise, data=representation_data)
+scatterplot(correct~intrastim_corr, data=representation_data)
+scatterplot(correct~interstim_dist, data=representation_data)
+scatterplot(intrastim_corr~surprise, data=representation_data)
+scatterplot(interstim_dist~surprise, data=representation_data)
+```
+
+### Centering
+```{r}
+scale_columns = function(data, columns) {
+
+  for (col in columns) {
+    if (col %in% names(data)) {
+      scaled_col <- as.vector(scale(data[[col]], scale=TRUE))
+      data[[col]] <- scaled_col
+    } else {
+      warning(paste("Column", col, "not found in the dataframe. Skipping..."))
+    }
+  }
+
+  return(data)
+}
+
+columns_to_scale = names(representation_data)[sapply(representation_data, is.numeric)]  # keep numeric columns
+columns_to_scale = columns_to_scale[!columns_to_scale %in% c("X", "correct", "surprise")]
+representation_data = scale_columns(representation_data, columns_to_scale)
+```
+
+### predict correct from representations
+```{r}
+model = glmer(correct ~ intrastim_corr + interstim_dist + (1 | subject) + (1 | subject:electrode), data = representation_data, family = binomial(link='logit'))
+summary(model)
+
+model = glmer(correct ~ intrastim_corr + interstim_dist + (1 | subject:electrode), data = representation_data, family = binomial(link='logit'))
+summary(model)
+
+model = glmer(correct ~ intrastim_corr + interstim_dist + (1 | subject), data = representation_data, family = binomial(link='logit'))
+summary(model)
+
+model = glmer(correct ~ intrastim_corr + (1 | subject), data = representation_data, family = binomial(link='logit'))
+summary(model)
+model = glmer(correct ~ interstim_dist + (1 | subject), data = representation_data, family = binomial(link='logit'))
+summary(model)
+
+model = glmer(correct ~ intrastim_corr + interstim_dist + (intrastim_corr + interstim_dist | subject), data = representation_data, family = binomial(link='logit'))
+summary(model)
+```
+
+
+### decode surprise from representations
+```{r}
+model = glmer(surprise ~ intrastim_corr + interstim_dist + (1 | subject), data = representation_data, family = Gamma(link='log'))
+summary(model)
+
+model = lmer(surprise ~ intrastim_corr + interstim_dist + (1 | subject), data = representation_data)
+summary(model)
+
+model = lme(surprise ~ interstim_dist, random = ~ 1|subject, data = representation_data)
+summary(model)
+
+model = lm(surprise ~ intrastim_corr, data = representation_data)
+summary(model)
+model = lm(surprise ~ interstim_dist, data = representation_data)
+summary(model)
+```
