@@ -4317,6 +4317,8 @@ def plot_individual_electrode_scalar(data_path, behavior_path, regions, first_pa
     #          f"Beta = {round(result_full.params['Novelty_retrieval'], 2)}, p = {round(p_value, 5)}")
     plt.tight_layout()
 
+    fig.savefig('/home/mathieu/These/data/meg_maestro/pac_analysis/seeg/epochs_rms_all_channels/glmm_novelty_retrieval.svg')
+
 
     # novelty vs. retrieval analysis
     novelty_list = []
@@ -4391,6 +4393,264 @@ def plot_individual_electrode_scalar(data_path, behavior_path, regions, first_pa
     plt.show()
 
     return
+
+def plot_individual_electrode_scalar_novelty_vs_recognition_all_regions(data_path, behavior_path, regions_list, title_list, first_parcel_label=True, analysis_name='rms'):
+    """"""
+    behavior_all = pd.read_csv(behavior_path)
+    path = Path(data_path)
+    subject_paths = sorted(list(path.glob(f'*epochs_{analysis_name}.pkl')))
+    del subject_paths[1]
+    subject_names = []
+    print(subject_paths)
+
+    conditions = ['correct_incorrect', 'encoding', 'novelty', 'retrieval', 'memory', 'response']
+
+    fig, axs = plt.subplots(3, 3, figsize=(15, 15), sharex=True, sharey=True)
+    axs = axs.flat
+    for r, regions in enumerate(regions_list):
+
+        rms_contrasts = [[] for c in range(len(conditions))]
+        subject_id = [[] for c in range(len(conditions))]  # used for color
+
+        for i, subject_path in enumerate(tqdm(subject_paths)):
+            subject_name = Path(subject_path).name[:6]
+            subject_names.append(subject_name)
+            behavior = behavior_all[behavior_all['subject'] == subject_name]
+            correct_all = behavior[(behavior['correct'] == 1)]['stim_name'].tolist()
+            incorrect_all = behavior[(behavior['correct'] == 0)]['stim_name'].tolist()
+            correct_novelty = behavior[(behavior['correct'] == 1) & (behavior['rep1'] == 1)]['stim_name'].tolist()
+            incorrect_novelty = behavior[(behavior['correct'] == 0) & (behavior['rep1'] == 1)]['stim_name'].tolist()
+            correct_retrieval = behavior[(behavior['correct'] == 1) & (behavior['rep2'] == 1)]['stim_name'].tolist()
+            incorrect_retrieval = behavior[(behavior['correct'] == 0) & (behavior['rep2'] == 1)]['stim_name'].tolist()
+            correct_rep2 = behavior[(behavior['rep2'] == 1) & (behavior['correct'] == 1)]['stim_identity'].tolist()
+            incorrect_rep2 = behavior[(behavior['rep2'] == 1) & (behavior['correct'] == 0)]['stim_identity'].tolist()
+            correct_encoding = behavior[(behavior['rep1'] == 1) & (behavior['stim_identity'].isin(correct_rep2))]['stim_name'].tolist()
+            incorrect_encoding = behavior[(behavior['rep1'] == 1) & (behavior['stim_identity'].isin(incorrect_rep2))]['stim_name'].tolist()
+            memorized = behavior[(behavior['correct'] == 1) & (behavior['rep2'] == 1)]['stim_name'].tolist()
+            novel = behavior[(behavior['correct'] == 1) & (behavior['rep1'] == 1)]['stim_name'].tolist()
+            new = behavior[(behavior['resp'] == 1)]['stim_name'].tolist()
+            old = behavior[(behavior['resp'] == 2)]['stim_name'].tolist()
+
+            rms_obj = np.load(subject_path, allow_pickle=True)
+            rms = rms_obj[analysis_name]
+            parcellations = rms_obj['ch_parcellations']
+            if first_parcel_label == True:
+                parcellations = [[parcel[0]] for parcel in parcellations]
+            elif first_parcel_label=="advanced":
+                go_next = ['Unknown', 'ctx-rh-unknown', 'ctx-lh-unknown']
+                parcellations = select_parcel(parcellations, go_next)
+            # print(np.array(rms_obj['ch_names']))
+
+            for cond, correct_incorrect in enumerate([[correct_all, incorrect_all], [correct_encoding, incorrect_encoding], [correct_novelty, incorrect_novelty], [correct_retrieval, incorrect_retrieval], [memorized, novel], [new, old]]):
+                correct = [e for e in range(len(rms_obj['stim_name'])) if rms_obj['stim_name'][e] in correct_incorrect[0]]
+                incorrect = [e for e in range(len(rms_obj['stim_name'])) if rms_obj['stim_name'][e] in correct_incorrect[1]]
+                if (len(correct) > 0) & (len(incorrect) > 0):
+                    for c in range(rms.shape[1]):
+                        for region in regions:
+                            if any(ch_parcel in region for ch_parcel in parcellations[c]):
+                                observed_diff, _ = permute_labels_and_compute_contrast(rms[:, c], correct, incorrect, n_permutations=1000)
+                                rms_contrasts[cond].append(observed_diff)
+                                subject_id[cond].append(i)
+
+
+        # Define subject colors
+        subject_colors = plt.get_cmap('Set3').colors
+        # subject_colors = [subject_colors[i] for i in range(len(subject_colors)) if i != 1]  # different colors (but same as the ones used for regions)
+        subject_colors = ['lightgray' for i in range(len(subject_colors)) if i != 1]  # all the same color
+
+        # Create DataFrame
+        data_dict = {
+            'Novelty_retrieval': rms_contrasts[2],
+            'Retrieval': rms_contrasts[3],
+            'SubjectID': subject_id[2]
+        }
+        model_data = pd.DataFrame(data_dict)
+
+        # Compute mean and std for outlier detection
+        mean_novelty = model_data['Novelty_retrieval'].mean()
+        std_novelty = model_data['Novelty_retrieval'].std()
+        mean_retrieval = model_data['Retrieval'].mean()
+        std_retrieval = model_data['Retrieval'].std()
+
+        # Mask to identify outliers
+        outlier_mask = (
+                (np.abs(model_data['Novelty_retrieval'] - mean_novelty) > 3 * std_novelty) |
+                (np.abs(model_data['Retrieval'] - mean_retrieval) > 3 * std_retrieval)
+        )
+
+        # Data without outliers (for visualization & plotting regression)
+        plot_data = model_data[~outlier_mask]
+
+        # Assign colors after reordering subjects
+        colors = [subject_colors[s] for s in plot_data['SubjectID']]
+
+        # Plot scatter (without outliers)
+        axs[r].scatter(plot_data['Novelty_retrieval'], plot_data['Retrieval'], color=colors, s=12, alpha=0.6)
+        if r >= 6:
+            axs[r].set_xlabel('Novelty (% change of activity)', fontsize=17)
+        if r % 3 == 0:
+            axs[r].set_ylabel('Recognition (% change of activity)', fontsize=17)
+        axs[r].tick_params(axis='y', labelsize=17)
+        axs[r].tick_params(axis='x', labelsize=17)
+        axs[r].axvline(0, ls='--', color='k')
+        axs[r].axhline(0, ls='--', color='k')
+        axs[r].set_title(title_list[r], fontsize=17)
+
+        # Fit mixed-effects model (using full dataset for stats)
+        model_full = MixedLM.from_formula('Retrieval ~ Novelty_retrieval', groups='SubjectID', data=model_data)
+        result_full = model_full.fit()
+        print(result_full.summary())
+
+        # Fit a new model for visualization (without outliers)
+        model_plot = MixedLM.from_formula('Retrieval ~ Novelty_retrieval', groups='SubjectID', data=plot_data)
+        result_plot = model_plot.fit()
+
+        # Plot regression line (without outliers)
+        x_vals = np.linspace(min(plot_data['Novelty_retrieval']), max(plot_data['Novelty_retrieval']), 100)
+        y_vals = result_plot.params['Intercept'] + result_plot.params['Novelty_retrieval'] * x_vals
+        axs[r].plot(x_vals, y_vals, color='k', linewidth=5, zorder=10)
+
+        # Plot individual subject fits (without outliers)
+        unique_subjects = np.unique(plot_data['SubjectID'])
+        for subj in unique_subjects:
+            mask = plot_data['SubjectID'] == subj
+            x_subj = plot_data.loc[mask, 'Novelty_retrieval']
+            y_subj = plot_data.loc[mask, 'Retrieval']
+            if len(x_subj) > 1:  # Ensure enough points to fit
+                slope, intercept = np.polyfit(x_subj, y_subj, 1)
+                x_range = np.linspace(min(x_subj), max(x_subj), 100)
+                axs[r].plot(x_range, slope * x_range + intercept, color=subject_colors[subj], lw=3, alpha=1)
+
+    plt.tight_layout()
+
+    fig.savefig('/home/mathieu/These/data/meg_maestro/pac_analysis/seeg/epochs_rms_all_channels/glmm_novelty_retrieval_all_regions.svg')
+
+    plt.show()
+
+    return
+
+
+def plot_individual_electrode_scalar_old_vs_new_all_regions(data_path, behavior_path, regions_list, title_list, first_parcel_label=True, analysis_name='rms'):
+    """"""
+    behavior_all = pd.read_csv(behavior_path)
+    path = Path(data_path)
+    subject_paths = sorted(list(path.glob(f'*epochs_{analysis_name}.pkl')))
+    del subject_paths[1]
+    subject_names = []
+    print(subject_paths)
+
+    fig, axs = plt.subplots(3, 3, figsize=(15, 15), sharex=True, sharey=True)
+    axs = axs.flat
+    for r, regions in enumerate(regions_list):
+
+        old_activity = []
+        new_activity = []
+        subject_id = []  # used for color
+
+        for i, subject_path in enumerate(tqdm(subject_paths)):
+            subject_name = Path(subject_path).name[:6]
+            subject_names.append(subject_name)
+            behavior = behavior_all[behavior_all['subject'] == subject_name]
+            new = behavior[(behavior['resp'] == 1)]['stim_name'].tolist()
+            old = behavior[(behavior['resp'] == 2)]['stim_name'].tolist()
+
+            rms_obj = np.load(subject_path, allow_pickle=True)
+            rms = rms_obj[analysis_name]
+            parcellations = rms_obj['ch_parcellations']
+            if first_parcel_label == True:
+                parcellations = [[parcel[0]] for parcel in parcellations]
+            elif first_parcel_label=="advanced":
+                go_next = ['Unknown', 'ctx-rh-unknown', 'ctx-lh-unknown']
+                parcellations = select_parcel(parcellations, go_next)
+            # print(np.array(rms_obj['ch_names']))
+
+            old_response = [e for e in range(len(rms_obj['stim_name'])) if rms_obj['stim_name'][e] in old]
+            new_response = [e for e in range(len(rms_obj['stim_name'])) if rms_obj['stim_name'][e] in new]
+            if (len(correct) > 0) & (len(incorrect) > 0):
+                for c in range(rms.shape[1]):
+                    for region in regions:
+                        if any(ch_parcel in region for ch_parcel in parcellations[c]):
+                            old_activity.append(np.mean(rms[:, c][old_response]))
+                            new_activity.append(np.mean(rms[:, c][new_response]))
+                            subject_id.append(i)
+
+
+        # Define subject colors
+        subject_colors = plt.get_cmap('Set3').colors
+        # subject_colors = [subject_colors[i] for i in range(len(subject_colors)) if i != 1]  # different colors (but same as the ones used for regions)
+        subject_colors = ['lightgray' for i in range(len(subject_colors)) if i != 1]  # all the same color
+
+        # Create DataFrame
+        data_dict = {
+            'Novelty_retrieval': new_activity,
+            'Retrieval': old_activity,
+            'SubjectID': subject_id[2]
+        }
+        model_data = pd.DataFrame(data_dict)
+
+        # Compute mean and std for outlier detection
+        mean_novelty = model_data['Novelty_retrieval'].mean()
+        std_novelty = model_data['Novelty_retrieval'].std()
+        mean_retrieval = model_data['Retrieval'].mean()
+        std_retrieval = model_data['Retrieval'].std()
+
+        # Mask to identify outliers
+        outlier_mask = (
+                (np.abs(model_data['Novelty_retrieval'] - mean_novelty) > 3 * std_novelty) |
+                (np.abs(model_data['Retrieval'] - mean_retrieval) > 3 * std_retrieval)
+        )
+
+        # Data without outliers (for visualization & plotting regression)
+        plot_data = model_data[~outlier_mask]
+
+        # Assign colors after reordering subjects
+        colors = [subject_colors[s] for s in plot_data['SubjectID']]
+
+        # Plot scatter (without outliers)
+        axs[r].scatter(plot_data['Novelty_retrieval'], plot_data['Retrieval'], color=colors, s=12, alpha=0.6)
+        if r >= 6:
+            axs[r].set_xlabel('New response activity', fontsize=17)
+        if r % 3 == 0:
+            axs[r].set_ylabel('Old response activity', fontsize=17)
+        axs[r].tick_params(axis='y', labelsize=17)
+        axs[r].tick_params(axis='x', labelsize=17)
+        axs[r].axvline(0, ls='--', color='k')
+        axs[r].axhline(0, ls='--', color='k')
+        axs[r].set_title(title_list[r], fontsize=17)
+
+        # Fit mixed-effects model (using full dataset for stats)
+        model_full = MixedLM.from_formula('Retrieval ~ Novelty_retrieval', groups='SubjectID', data=model_data)
+        result_full = model_full.fit()
+        print(result_full.summary())
+
+        # Fit a new model for visualization (without outliers)
+        model_plot = MixedLM.from_formula('Retrieval ~ Novelty_retrieval', groups='SubjectID', data=plot_data)
+        result_plot = model_plot.fit()
+
+        # Plot regression line (without outliers)
+        x_vals = np.linspace(min(plot_data['Novelty_retrieval']), max(plot_data['Novelty_retrieval']), 100)
+        y_vals = result_plot.params['Intercept'] + result_plot.params['Novelty_retrieval'] * x_vals
+        axs[r].plot(x_vals, y_vals, color='k', linewidth=5, zorder=10)
+
+        # Plot individual subject fits (without outliers)
+        unique_subjects = np.unique(plot_data['SubjectID'])
+        for subj in unique_subjects:
+            mask = plot_data['SubjectID'] == subj
+            x_subj = plot_data.loc[mask, 'Novelty_retrieval']
+            y_subj = plot_data.loc[mask, 'Retrieval']
+            if len(x_subj) > 1:  # Ensure enough points to fit
+                slope, intercept = np.polyfit(x_subj, y_subj, 1)
+                x_range = np.linspace(min(x_subj), max(x_subj), 100)
+                axs[r].plot(x_range, slope * x_range + intercept, color=subject_colors[subj], lw=3, alpha=1)
+
+    plt.tight_layout()
+
+    fig.savefig('/home/mathieu/These/data/meg_maestro/pac_analysis/seeg/epochs_rms_all_channels/glmm_old_new_all_regions.svg')
+
+    plt.show()
+
+    return
+
 
 def plot_individual_subject_scalar(data_path, behavior_path, regions, first_parcel_label=True, analysis_name='rms'):
     """electrode-level test (FDR corrected) used to plot rms, gamma power or other scalar saved with the same format."""
@@ -4960,6 +5220,7 @@ def plot_individual_electrode_scalar_temporal_regions_comparison(data_path, beha
 
     return
 
+
 def plot_individual_electrode_scalar_temporal_regions_comparison_one_figure(data_path, behavior_path, regions, first_parcel_label=True, analysis_name='abs'):
     """electrode-level temporal plot used to plot rms, gamma power or other scalar saved with the same format."""
     behavior_all = pd.read_csv(behavior_path)
@@ -5011,7 +5272,8 @@ def plot_individual_electrode_scalar_temporal_regions_comparison_one_figure(data
                             subject_id[cond].append(i)
 
     # fig, axs = plt.subplots(1, len(conditions), sharex=True, sharey=True)
-    fig, axs = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
+    # fig, axs = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
+    fig, axs = plt.subplots(1, 4, figsize=(20, 5), sharey=True)
     region_colors = plt.get_cmap('Set2').colors
     region_colors = ['#FF1100', '#3B2AF5']
     # region_colors = plt.get_cmap('tab20').colors
@@ -5070,7 +5332,6 @@ def plot_individual_electrode_scalar_temporal_regions_comparison_one_figure(data
     # plot
     current = 0
     for i, (condition, rms) in enumerate(zip(conditions, rms_contrasts)):
-        axs[i].axhline(0, ls='--', c='k')
         for r, region_rms in enumerate(rms):
             print(np.array(region_rms).shape)
             avg_contrast = np.mean(region_rms, axis=0)
@@ -5080,12 +5341,15 @@ def plot_individual_electrode_scalar_temporal_regions_comparison_one_figure(data
             axs[r].plot(times, avg_contrast, color=region_colors[i], label=condition + str(regions[r]), lw=3)
             axs[r].fill_between(times, avg_contrast - sem_contrast, avg_contrast + sem_contrast, color=region_colors[i], alpha=0.5, lw=0)
             current += 1
-        axs[i].set_xlabel(f'Time (s)', fontsize=17)
-        axs[i].tick_params(axis='y', labelsize=17)
-        axs[i].tick_params(axis='x', labelsize=17)
+    for r in range(len(rms_contrasts[0])):
+        axs[r].set_xlim(0, 8)
+        axs[r].axhline(0, ls='--', c='k', zorder=0)
+        axs[r].set_xlabel(f'Time (s)', fontsize=17)
+        axs[r].tick_params(axis='y', labelsize=17)
+        axs[r].tick_params(axis='x', labelsize=17)
+        # axs[r].legend()
     axs[0].set_ylabel(f'Percent change of activity', fontsize=17)
-    axs[0].legend()
-    axs[1].legend()
+    # axs[1].legend()
     for r in range(len(rms_contrasts[0])):
         mask = mask_list[r]
         print(mask.shape)
@@ -5101,6 +5365,160 @@ def plot_individual_electrode_scalar_temporal_regions_comparison_one_figure(data
 
     # Adjust the layout so the plots don't overlap
     plt.tight_layout()
+    plt.show()
+
+    return
+
+
+def plot_individual_electrode_scalar_temporal_regions_comparison_all_regions(data_path, behavior_path, regions, title_list, first_parcel_label=True, analysis_name='abs'):
+    """electrode-level temporal plot used to plot rms, gamma power or other scalar saved with the same format."""
+    behavior_all = pd.read_csv(behavior_path)
+    path = Path(data_path)
+    subject_paths = sorted(list(path.glob(f'*epochs_{analysis_name}.pkl')))
+    del subject_paths[1]
+    subject_names = []
+    print(subject_paths)
+
+    conditions = ['novelty', 'retrieval']
+
+    rms_contrasts = [[[] for r in range(len(regions))] for c in range(len(conditions))]
+    subject_id = [[] for c in range(len(conditions))]  # used for color
+
+    for i, subject_path in enumerate(tqdm(subject_paths)):
+        subject_name = Path(subject_path).name[:6]
+        subject_names.append(subject_name)
+        behavior = behavior_all[behavior_all['subject'] == subject_name]
+        correct_all = behavior[(behavior['correct'] == 1)]['stim_name'].tolist()
+        incorrect_all = behavior[(behavior['correct'] == 0)]['stim_name'].tolist()
+        correct_novelty = behavior[(behavior['correct'] == 1) & (behavior['rep1'] == 1)]['stim_name'].tolist()
+        incorrect_novelty = behavior[(behavior['correct'] == 0) & (behavior['rep1'] == 1)]['stim_name'].tolist()
+        correct_retrieval = behavior[(behavior['correct'] == 1) & (behavior['rep2'] == 1)]['stim_name'].tolist()
+        incorrect_retrieval = behavior[(behavior['correct'] == 0) & (behavior['rep2'] == 1)]['stim_name'].tolist()
+        correct_rep2 = behavior[(behavior['rep2'] == 1) & (behavior['correct'] == 1)]['stim_identity'].tolist()
+        incorrect_rep2 = behavior[(behavior['rep2'] == 1) & (behavior['correct'] == 0)]['stim_identity'].tolist()
+        correct_encoding = behavior[(behavior['rep1'] == 1) & (behavior['stim_identity'].isin(correct_rep2))]['stim_name'].tolist()
+        incorrect_encoding = behavior[(behavior['rep1'] == 1) & (behavior['stim_identity'].isin(incorrect_rep2))]['stim_name'].tolist()
+        memorized = behavior[(behavior['correct'] == 1) & (behavior['rep2'] == 1)]['stim_name'].tolist()
+        novel = behavior[(behavior['correct'] == 1) & (behavior['rep1'] == 1)]['stim_name'].tolist()
+
+        rms_obj = np.load(subject_path, allow_pickle=True)
+        rms = rms_obj[analysis_name]
+        parcellations = rms_obj['ch_parcellations']
+        if first_parcel_label == True:
+            parcellations = [[parcel[0]] for parcel in parcellations]
+        elif first_parcel_label == "advanced":
+            go_next = ['Unknown', 'ctx-rh-unknown', 'ctx-lh-unknown']
+            parcellations = select_parcel(parcellations, go_next)
+
+        for cond, correct_incorrect in enumerate([[correct_novelty, incorrect_novelty], [correct_retrieval, incorrect_retrieval]]):
+            correct = [e for e in range(len(rms_obj['stim_name'])) if rms_obj['stim_name'][e] in correct_incorrect[0]]
+            incorrect = [e for e in range(len(rms_obj['stim_name'])) if rms_obj['stim_name'][e] in correct_incorrect[1]]
+            if (len(correct) > 0) & (len(incorrect) > 0):
+                for c in range(rms.shape[1]):
+                    for r, region in enumerate(regions):
+                        if any(ch_parcel in region for ch_parcel in parcellations[c]):
+                            rms_contrasts[cond][r].append(np.mean(rms[correct, c, :], axis=0) - np.mean(rms[incorrect, c, :], axis=0))
+                            subject_id[cond].append(i)
+
+    fig, axs = plt.subplots(3, 3, figsize=(15, 15), sharex=True, sharey=True)
+    axs = axs.flat
+    region_colors = plt.get_cmap('Set2').colors
+    region_colors = ['#FF1100', '#3B2AF5']
+    # region_colors = plt.get_cmap('tab20').colors
+    # region_colors = [region_colors[13], region_colors[8], region_colors[12], region_colors[9]]
+    # Plot each condition's data in a separate subplot
+
+    # compute cluster stats
+    mask_list = [] # Store masks for test between conditions
+    mask_list_zero = [[] for _ in conditions]  # Store masks for condition vs. 0
+    for r in range(len(rms_contrasts[0])):
+        diff = np.array(rms_contrasts[0][r]) - np.array(rms_contrasts[1][r])
+        pval = 0.05  # arbitrary
+        df = len(diff) - 1  # degrees of freedom denominator
+        thresh = scipy.stats.t.ppf(1 - pval / 2, df=df)  # t distribution two-tailed
+        # thresh = scipy.stats.t.ppf(1 - pval, df=df)  # t distribution one-tailed
+        print(thresh)
+        T_obs, clusters, cluster_pv, H0 = permutation_cluster_1samp_test(diff,
+                                                                         threshold=thresh,
+                                                                         n_permutations=10000, tail=0,
+                                                                         adjacency=None, n_jobs=-1)
+        print(T_obs.shape)
+        print(clusters)
+        print(cluster_pv)
+        # Create a mask for significant clusters
+        significant_mask = np.zeros_like(T_obs, dtype=bool)
+        print(sorted(cluster_pv))
+        for j, cl in enumerate(clusters):
+            if cluster_pv[j] <= 0.05:
+                significant_mask[cl] = True
+        mask_list.append(significant_mask)
+
+    # tests against 0
+    for r in range(len(rms_contrasts[0])):
+        for cond in range(len(conditions)):
+            diff = np.array(rms_contrasts[cond][r])
+            pval = 0.05  # arbitrary
+            df = len(diff) - 1  # degrees of freedom denominator
+            thresh = scipy.stats.t.ppf(1 - pval / 2, df=df)  # t distribution two-tailed
+            # thresh = scipy.stats.t.ppf(1 - pval, df=df)  # t distribution one-tailed
+            print(thresh)
+            T_obs, clusters, cluster_pv, H0 = permutation_cluster_1samp_test(diff,
+                                                                             threshold=thresh,
+                                                                             n_permutations=10000, tail=0,
+                                                                             adjacency=None, n_jobs=-1)
+            print(T_obs.shape)
+            print(clusters)
+            print(cluster_pv)
+            # Create a mask for significant clusters
+            significant_mask = np.zeros_like(T_obs, dtype=bool)
+            print(sorted(cluster_pv))
+            for j, cl in enumerate(clusters):
+                if cluster_pv[j] <= 0.05:
+                    significant_mask[cl] = True
+            mask_list_zero[cond].append(significant_mask)
+
+    # plot
+    current = 0
+    for i, (condition, rms) in enumerate(zip(conditions, rms_contrasts)):
+        for r, region_rms in enumerate(rms):
+            print(np.array(region_rms).shape)
+            avg_contrast = np.mean(region_rms, axis=0)
+            sem_contrast = np.std(region_rms, axis=0) / np.sqrt(len(region_rms))
+            times = np.linspace(0, 8, avg_contrast.shape[0])
+            # axs.plot(times, avg_contrast/sem_contrast, color=region_colors[r], label=regions[r])
+            axs[r].plot(times, avg_contrast, color=region_colors[i], label=condition + str(regions[r]), lw=3)
+            axs[r].fill_between(times, avg_contrast - sem_contrast, avg_contrast + sem_contrast, color=region_colors[i], alpha=0.5, lw=0)
+            current += 1
+    for r in range(len(rms_contrasts[0])):
+        axs[r].set_xlim(0, 8)
+        axs[r].axhline(0, ls='--', c='k', zorder=0)
+        if r >= 6:
+            axs[r].set_xlabel(f'Time (s)', fontsize=17)
+        if r % 3 ==0:
+            axs[r].set_ylabel(f'Percent change of activity', fontsize=17)
+        axs[r].tick_params(axis='y', labelsize=17)
+        axs[r].tick_params(axis='x', labelsize=17)
+        axs[r].set_title(title_list[r], fontsize=17)
+        # axs[r].legend()
+    # axs[1].legend()
+    for r in range(len(rms_contrasts[0])):
+        mask = mask_list[r]
+        print(mask.shape)
+        print(axs[r].get_ylim()[0])
+        # mask = np.ma.masked_where(~mask, (axs[r].get_ylim()[0]) * np.ones_like(times))  # we mask what is not significant
+        mask = np.ma.masked_where(~mask, -10 * np.ones_like(times))  # we mask what is not significant
+        axs[r].plot(times, mask, 'k', linewidth=3)
+        for cond in range(len(conditions)):
+            mask = mask_list_zero[cond][r]
+            # mask = np.ma.masked_where(~mask, (axs[r].get_ylim()[0]) * np.ones_like(times))  # we mask what is not significant
+            mask = np.ma.masked_where(~mask, -(7+cond*1.5) * np.ones_like(times))  # we mask what is not significant
+            axs[r].plot(times, mask, color=region_colors[cond], linewidth=3)
+
+    # Adjust the layout so the plots don't overlap
+    plt.tight_layout()
+
+    fig.savefig('/home/mathieu/These/data/meg_maestro/pac_analysis/seeg/epochs_ma_rms_all_channels/ma_rms_contrasts_all_regions.svg')
+
     plt.show()
 
     return
@@ -9976,13 +10394,23 @@ if __name__ == "__main__":
     #            'Left-Amygdala', 'ctx-lh-parahippocampal', 'ctx-lh-temporalpole', 'ctx-lh-inferiortemporal',
     #            'ctx-lh-entorhinal', 'Right-Hippocampus', 'Right-Amygdala', 'ctx-rh-parahippocampal',
     #            'ctx-rh-inferiortemporal']  # regions of temporal lobe that show a power contrast
-    plot_individual_electrode_scalar(data_path, behavior_path, regions, first_parcel_label=first_parcel_label, analysis_name=analysis_name)
+    # plot_individual_electrode_scalar(data_path, behavior_path, regions, first_parcel_label=first_parcel_label, analysis_name=analysis_name)
     """plot_individual_subject_scalar"""
     # plot_individual_subject_scalar(data_path, behavior_path, regions, first_parcel_label=first_parcel_label, analysis_name=analysis_name)
     """plot_individual_electrode_scalar_windows"""
     # plot_individual_electrode_scalar_windows(data_path, behavior_path, regions, first_parcel_label=first_parcel_label, analysis_name=analysis_name, remove_outliers=True)
     """plot_individual_subject_scalar_windows"""
     # plot_individual_subject_scalar_windows(data_path, behavior_path, regions, first_parcel_label=first_parcel_label, analysis_name=analysis_name)
+    """plot_individual_electrode_scalar_novelty_vs_recognition_all_regions"""
+    regions_list = [['ctx-lh-transversetemporal', 'ctx-rh-transversetemporal'], ['ctx-lh-superiortemporal', 'ctx-rh-superiortemporal'],
+                    ['ctx-lh-middletemporal', 'ctx-rh-middletemporal'], ['ctx-lh-inferiortemporal', 'ctx-rh-inferiortemporal'],
+                    ['ctx-lh-temporalpole', 'ctx-rh-temporalpole'], ['ctx-lh-entorhinal', 'ctx-rh-entorhinal'],
+                    ['ctx-lh-parahippocampal', 'ctx-rh-parahippocampal'], ['Left-Hippocampus', 'Right-Hippocampus'],
+                    ['Left-Amygdala', 'Right-Amygdala']
+                    ]
+    title_list = ['Transverse temporal', 'Superior temporal gyrus', 'Middle temporal gyrus', 'Inferior temporal gyrus', 'Temporal pole', 'Entorhinal cortex', 'Parahippocampal gyrus', 'Hippocampus', 'Amygdala']
+    # plot_individual_electrode_scalar_novelty_vs_recognition_all_regions(data_path, behavior_path, regions_list, title_list, first_parcel_label=first_parcel_label, analysis_name=analysis_name)
+    # plot_individual_electrode_scalar_old_vs_new_all_regions(data_path, behavior_path, regions_list, title_list, first_parcel_label=first_parcel_label, analysis_name=analysis_name)
 
     """loop_plot_scalar_window_regions"""
     # regions_lists = [
@@ -10043,8 +10471,22 @@ if __name__ == "__main__":
     # regions = ['ctx-lh-temporalpole']
     # plot_individual_electrode_scalar_temporal(data_path, behavior_path, regions, first_parcel_label=first_parcel_label, analysis_name=analysis_name)
     # plot_individual_electrode_scalar_temporal_regions_comparison(data_path, behavior_path, regions, first_parcel_label=first_parcel_label, analysis_name=analysis_name)
-    regions = [['Left-Hippocampus', 'Right-Hippocampus'], ['Left-Amygdala', 'Right-Amygdala']]
-    plot_individual_electrode_scalar_temporal_regions_comparison_one_figure(data_path, behavior_path, regions, first_parcel_label=first_parcel_label, analysis_name=analysis_name)
+    regions = [['Left-Hippocampus', 'Right-Hippocampus']]
+    regions = [['Left-Hippocampus', 'Right-Hippocampus'], ['Left-Amygdala', 'Right-Amygdala'], ['ctx-lh-parahippocampal', 'ctx-rh-parahippocampal'], ['ctx-lh-temporalpole', 'ctx-rh-temporalpole']]
+    # plot_individual_electrode_scalar_temporal_regions_comparison_one_figure(data_path, behavior_path, regions, first_parcel_label=first_parcel_label, analysis_name=analysis_name)
+    regions = [['ctx-lh-transversetemporal', 'ctx-rh-transversetemporal'],
+                    ['ctx-lh-superiortemporal', 'ctx-rh-superiortemporal'],
+                    ['ctx-lh-middletemporal', 'ctx-rh-middletemporal'],
+                    ['ctx-lh-inferiortemporal', 'ctx-rh-inferiortemporal'],
+                    ['ctx-lh-temporalpole', 'ctx-rh-temporalpole'], ['ctx-lh-entorhinal', 'ctx-rh-entorhinal'],
+                    ['ctx-lh-parahippocampal', 'ctx-rh-parahippocampal'], ['Left-Hippocampus', 'Right-Hippocampus'],
+                    ['Left-Amygdala', 'Right-Amygdala']
+                    ]
+    title_list = ['Transverse temporal', 'Superior temporal gyrus', 'Middle temporal gyrus', 'Inferior temporal gyrus',
+                  'Temporal pole', 'Entorhinal cortex', 'Parahippocampal gyrus', 'Hippocampus', 'Amygdala']
+    plot_individual_electrode_scalar_temporal_regions_comparison_all_regions(data_path, behavior_path, regions, title_list,
+                                                                            first_parcel_label=first_parcel_label,
+                                                                            analysis_name=analysis_name)
 
     """decode_surprise_from_comodulogram"""
     data_path = '/home/mathieupvc/These/data/meg_maestro/pac_analysis/seeg/epochs_comodulogram_low_resolution_all_channels'

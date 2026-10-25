@@ -1232,12 +1232,13 @@ if __name__ == '__main__':
     #                    )
 
     '''create_seeg_data_matrix'''
-    # create_seeg_data_matrix("/home/mathieu/These/data/meg_maestro/note_analysis_seeg/epochs_1s_all_meta",
-    #                         '/home/mathieu/These/data/meg_maestro/seeg_behavior_data',
-    #                         '/home/mathieu/These/data/meg_maestro/exp_stim_seeg',
-    #                         '/home/mathieu/These/data/meg_maestro/behavior_analysis/seeg_behavior',
-    #                         signal_type='raw', montage='mono', remove=None, tmin=0, tmax=8,
-    #                         min_time_interval=0.050, only_repeated=True)
+    create_seeg_data_matrix("/home/mathieu/These/data/meg_maestro/note_analysis_seeg/epochs_1s_all_meta",
+                            '/home/mathieu/These/data/meg_maestro/seeg_behavior_data',
+                            '/home/mathieu/These/data/meg_maestro/exp_stim_seeg',
+                            # '/home/mathieu/These/data/meg_maestro/behavior_analysis/seeg_behavior',
+                            '/home/mathieu/seeg_behavior_test',
+                            signal_type='raw', montage='mono', remove=None, tmin=0, tmax=8,
+                            min_time_interval=0.050, only_repeated=False)
 
     '''correlation_matrix'''
     # correlation_matrix(data_matrix_path='/home/mathieupvc/These/data/meg_maestro/behavior_analysis/behavior_data_matrix.csv')

@@ -4585,7 +4585,7 @@ def full_dual_mechanism_model(rms_path, behavior_path, similarity_path, distance
     def linear_func(x, a, b):
         return a * x + b
 
-    func = linear_func
+    func = exp_func
 
     subject_id = []
     correct_full_list = []
@@ -5052,10 +5052,14 @@ def full_dual_mechanism_model_R2_threshold_impact(rms_path, behavior_path, simil
 
     coefs_intra = [[] for _ in range(len(r2_threshold_list))]
     coefs_inter = [[] for _ in range(len(r2_threshold_list))]
+    logL = [[] for _ in range(len(r2_threshold_list))]
 
     for c, r2_threshold in enumerate(tqdm(r2_threshold_list)):
         for s, subject in enumerate(data["subjects"]):
             if subject != 'Bou_Ni':
+                subject_coefs_intra = []
+                subject_coefs_inter = []
+                subject_logL = []
                 subject_stim_features = stim_features[stim_features['subject'] == subject]
                 subject_info = data['info'][s]
                 ch_names = subject_info['ch_names']
@@ -5116,13 +5120,21 @@ def full_dual_mechanism_model_R2_threshold_impact(rms_path, behavior_path, simil
                             model = LogisticRegression(penalty=None)
                             model.fit(X, correct_list)
 
-                            coefs_intra[c].append(model.coef_[0, 0])
-                            coefs_inter[c].append(model.coef_[0, 1])
+                            subject_coefs_intra.append(model.coef_[0, 0])
+                            subject_coefs_inter.append(model.coef_[0, 1])
+
+                            # store model logL
+                            proba = model.predict_proba(X)
+                            subject_logL.append(logistic_log_likelihood(correct_list, proba[:, 1]))
+                if len(subject_coefs_intra) > 0:
+                    coefs_intra[c].append(np.mean(subject_coefs_intra))
+                    coefs_inter[c].append(np.mean(subject_coefs_inter))
+                    logL[c].append(np.mean(subject_logL))
 
     print([len(coefs) for coefs in coefs_intra])
     print([len(coefs) for coefs in coefs_inter])
 
-    fig, axes = plt.subplots(1, 1, figsize=(5, 5), sharex=True)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
     labels = ['Similarity', 'Separability']
     colors = ['#FF928A', '#978EF5']
     for i, params in enumerate([coefs_intra, coefs_inter]):
@@ -5130,15 +5142,24 @@ def full_dual_mechanism_model_R2_threshold_impact(rms_path, behavior_path, simil
         sem = np.array([np.std(p, ddof=1) / np.sqrt(len(p)) for p in params])
         # axes[0].plot(r2_threshold_list, mean, c=colors[i], label=labels[i], lw=3)
         # axes[0].fill_between(r2_threshold_list, mean - sem, mean + sem, color=colors[i], alpha=0.3, lw=0)
-        axes.plot(r2_threshold_list, mean / sem, c=colors[i], label=labels[i], lw=3)
+        axes[0].plot(r2_threshold_list, mean / sem, c=colors[i], label=labels[i], lw=3)
     # for ax in axes:
-    axes.axhline(0, ls='--', color='k', zorder=0)
+    # axes[0].axhline(0, ls='--', color='k', zorder=0)
     # axes[0].set_ylabel("\u03B2 parameters")
-    axes.legend(fontsize=17)
-    axes.set_ylabel("\u03B2 parameters (t-values)", fontsize=17)
-    axes.set_xlabel("R² threshold", fontsize=17)
-    plt.tick_params(axis='y', labelsize=17)
-    plt.tick_params(axis='x', labelsize=17)
+    axes[0].legend(fontsize=17)
+    axes[0].set_ylabel("\u03B2 parameters (t-values)", fontsize=17)
+    axes[0].set_xlabel("R² threshold", fontsize=17)
+    axes[0].tick_params(axis='y', labelsize=17)
+    axes[0].tick_params(axis='x', labelsize=17)
+
+    logL_mean = np.array([np.mean(l) for l in logL])
+    logL_sem = np.array([np.std(l, ddof=1) / np.sqrt(len(l)) for l in logL])
+    axes[1].plot(r2_threshold_list, logL_mean, c='k', lw=3)
+    axes[1].fill_between(r2_threshold_list, logL_mean - logL_sem, logL_mean + logL_sem, color='k', alpha=0.3, lw=0)
+    axes[1].set_ylabel("Log-likelihood", fontsize=17)
+    axes[1].set_xlabel("R² threshold", fontsize=17)
+    axes[1].tick_params(axis='y', labelsize=17)
+    axes[1].tick_params(axis='x', labelsize=17)
 
     plt.tight_layout()
 
@@ -8233,13 +8254,13 @@ if __name__ == '__main__':
 
     '''intra_and_interstim_and_correct'''
     # data_path = '/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/similarity_matrix_medial_temporal.pkl'
-    intra_and_interstim_and_correct(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
+    # intra_and_interstim_and_correct(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
 
     '''impact_of_first_trials_to_remove'''
     # impact_of_first_trials_to_remove(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
 
     '''full_dual_mechanism_model'''
-    # full_dual_mechanism_model(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
+    full_dual_mechanism_model(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
     # full_dual_mechanism_model_R2_threshold_impact(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
     # full_dual_mechanism_model_linear_exp_comparison(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
     # full_dual_mechanism_model_separated_channels(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label, channel_selection='weight')
@@ -8283,7 +8304,7 @@ if __name__ == '__main__':
                'Left-Amygdala', 'ctx-lh-parahippocampal', 'ctx-lh-temporalpole', 'ctx-lh-inferiortemporal',
                'ctx-lh-entorhinal', 'Right-Hippocampus', 'Right-Amygdala', 'ctx-rh-parahippocampal',
                'ctx-rh-inferiortemporal']  # regions of temporal lobe that show a power contrast
-    # full_representation_analysis_by_region(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label='advanced', remove_outliers=True)
+    full_representation_analysis_by_region(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label='advanced', remove_outliers=True)
 
     '''representation_analysis_windows_seeg'''
     rms_path = '/home/mathieu/These/data/meg_maestro/pac_analysis/seeg/epochs_rms_all_channels'

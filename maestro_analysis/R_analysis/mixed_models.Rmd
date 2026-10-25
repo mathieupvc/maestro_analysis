@@ -1487,6 +1487,83 @@ correct = glmer(correct ~ rep + note_rate + position_in_block + surprise_mean_pa
 summary(correct)
 ```
 
+### Stim as random effect and surprise*rep interaction
+```{r}
+correct = glmer(correct ~ rep + note_rate + position_in_block + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + (1|subject),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+correct = glmer(correct ~ rep + note_rate + position_in_block + surprise_mean_paulrnn + (1|subject),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+
+correct = glmer(correct ~ rep + note_rate + position_in_block + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + (1|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+correct = glmer(correct ~ rep + note_rate + position_in_block + surprise_mean_paulrnn + (1|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+
+correct = glmer(correct ~ rep + note_rate + position_in_block + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + (1 + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2)|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+
+correct = glmer(correct ~ rep + note_rate + position_in_block + surprise_mean_paulrnn + (1 + surprise_mean_paulrnn |subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+```
+
+### rep*surprise interaction
+```{r}
+correct = glmer(correct ~ rep + note_rate + position_in_block + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + rep*surprise_mean_paulrnn + rep*I(surprise_mean_paulrnn**2) + (1|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+
+correct = glmer(correct ~ note_rate + position_in_block + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + (1|subject) + (1|stim_name),
+           data = behavior_seeg_rep1, family = binomial(link='logit'))
+summary(correct)
+correct = glmer(correct ~ note_rate + position_in_block + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + (1|subject) + (1|stim_name),
+           data = behavior_seeg_rep2, family = binomial(link='logit'))
+summary(correct)
+```
+
+### Nonlinear effects of trial position, block and rep*position interaction
+```{r}
+correct = glmer(correct ~ rep + note_rate + position_in_block + I(position_in_block**2) + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + (1|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+
+correct = glmer(correct ~ rep + note_rate + position_in_block + I(position_in_block**2) + I(position_in_block**3) + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + (1|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+
+correct = glmer(correct ~ rep + note_rate + position_in_block + seeg_block + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + (1|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+
+correct = glmer(correct ~ rep + note_rate + position_in_block + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + rep*position_in_block + (1|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+
+correct = glmer(correct ~ rep + note_rate + position_in_block + I(position_in_block**2) + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + rep*position_in_block + rep*I(position_in_block**2) + (1|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+
+correct = glmer(correct ~ rep + note_rate + position_in_block + I(position_in_block**2) + I(position_in_block**3) + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + rep*position_in_block + rep*I(position_in_block**2) + rep*I(position_in_block**3) + (1|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+
+correct = glmer(correct ~ rep + note_rate + seeg_block + position_in_block + I(position_in_block**2) + I(position_in_block**3) + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + rep*position_in_block + rep*I(position_in_block**2) + rep*I(position_in_block**3) + (1|subject) + (1|stim_name),
+           data = behavior_seeg, family = binomial(link='logit'))
+summary(correct)
+```
+
+### Is surprise related to trial position?
+```{r}
+position_surprise = lm(position_in_block ~ surprise_mean_paulrnn + I(surprise_mean_paulrnn**2), data = behavior_seeg)
+summary(position_surprise)
+```
+
+
 ### Rep 1 and 2, linear and quadratic surprise
 ```{r}
 correct = glmer(correct ~ rep + note_rate + position_in_block + surprise_mean_paulrnn + I(surprise_mean_paulrnn**2) + (1|subject),
