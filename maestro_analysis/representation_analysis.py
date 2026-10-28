@@ -24,8 +24,10 @@ from maestro_analysis.stats import permut_1sample_ttest_across_channels, already
 
 import statsmodels.api as sm
 from statsmodels.formula.api import mixedlm
+from statsmodels.genmod.bayes_mixed_glm import BinomialBayesMixedGLM
 from statsmodels.stats.anova import AnovaRM
 from statsmodels.regression.mixed_linear_model import MixedLM
+from statsmodels.genmod.bayes_mixed_glm import BinomialBayesMixedGLM
 import scipy
 from scipy.stats import ttest_ind, ttest_1samp, pearsonr, spearmanr, chi2_contingency, binom_test, binomtest
 from sklearn.decomposition import PCA
@@ -264,7 +266,8 @@ def save_trajectory_distance_matrix_seeg(data_path, save_path, regions=None, n_j
     return
 
 
-def save_distance_matrix_seeg(data_path, save_path, regions=None, n_jobs=-1):
+
+def save_distance_matrix_seeg(data_path, save_path, regions=None, normalize=False, n_jobs=-1):
     """Load seeg epochs and saves a pickle containing a distance matrix for every subject"""
 
     os.makedirs(save_path, exist_ok=True)
@@ -289,6 +292,9 @@ def save_distance_matrix_seeg(data_path, save_path, regions=None, n_jobs=-1):
             epochs.filter(0.5, None, n_jobs=n_jobs)  # highpass filter
             epochs.crop(tmin=0, tmax=8)  # remove onset and offset
             data = epochs.get_data()
+
+            if normalize:
+                data = (data - np.mean(data, axis=2, keepdims=True)) / np.std(data, axis=2, keepdims=True)  # z-score normalization across time for each epoch and channel
 
             subject_list.append(subject_path.name[:6])
             stim_name_list.append(epochs.metadata['stim_name'].to_list())
@@ -2268,6 +2274,7 @@ def full_representation_analysis_seeg(rms_path, behavior_path, similarity_path, 
     regression_param_feature_subject_mean = []
     # pvalues_array = []  # p value for the regression
     # p_ttest_array = []  # p value of the contrast correct vs incorrect
+    distance_window_size = 50
     for s, subject in tqdm(enumerate(data["subjects"])):
         if not subject == 'Bou_Ni':
             subject_stim_features = stim_features[stim_features['subject'] == subject]
@@ -2286,7 +2293,7 @@ def full_representation_analysis_seeg(rms_path, behavior_path, similarity_path, 
             for i, stim in enumerate(data['stim_names'][s]):
                 if i > first_trials_to_remove:  # remove first trials
                     if ('rep1' in stim) | ('rep2' in stim):
-                    # if 'rep2' in stim:
+                        # if 'rep1' in stim:
                         if stim in subject_stim_features['stim_name'].tolist():
                             if not np.isnan(subject_stim_features[subject_stim_features['stim_name'] == stim]["correct"].iloc[0]):
                                 # if subject_stim_features[subject_stim_features['stim_name'] == stim][condition].iloc[0] < 0.15:  # check that it works without extreme trials
@@ -2326,6 +2333,7 @@ def full_representation_analysis_seeg(rms_path, behavior_path, similarity_path, 
                 # for j in range(indices_to_keep[i], mask.shape[0]):
                 #     mask[j] = False  # remove following trials
                 mask[indices_to_keep[i]:] = False  # remove following trials
+                # mask[:indices_to_keep[i]-distance_window_size] = False  # only keep trials within a window before the current trial
                 # plt.hist(current_corr[mask, 10], bins=100)
                 # plt.show()
                 # print(np.mean(current_corr[mask, :], axis=0))
@@ -2703,6 +2711,965 @@ def full_representation_analysis_seeg(rms_path, behavior_path, similarity_path, 
 
     plt.show()
 
+
+
+def fit_crossed_mixed_model(df, outcome, predictor, binary):
+    """Fits outcome ~ predictor with crossed random intercepts for subject, channel and stimulus identity.
+    Binary outcomes use a logit link (variational Bayes GLMM, the only logit mixed model in statsmodels), continuous
+    outcomes use a linear mixed model. Returns (beta, standard error, z)."""
+    formula = f'{outcome} ~ {predictor}'
+    if binary:
+        # vc_formulas = {'subject': '0 + C(subject)', 'channel': '0 + C(channel)', 'stim': '0 + C(stim)'}
+        vc_formulas = {'subject': '0 + C(subject)', 'channel': '0 + C(channel)'}
+        model = BinomialBayesMixedGLM.from_formula(formula, vc_formulas, df)
+        result = model.fit_vb()
+        idx = model.exog_names.index(predictor)
+        beta, se = result.fe_mean[idx], result.fe_sd[idx]
+    else:
+        # a single dummy group containing all observations makes the variance components crossed
+        df = df.assign(all_obs=1)
+        # vc = {'subject': '0 + C(subject)', 'channel': '0 + C(channel)', 'stim': '0 + C(stim)'}
+        vc = {'subject': '0 + C(subject)', 'channel': '0 + C(channel)'}
+        model = MixedLM.from_formula(formula, groups='all_obs', vc_formula=vc, re_formula='0', data=df)
+        result = model.fit()
+        beta, se = result.params[predictor], result.bse[predictor]
+    return beta, se, beta / se
+
+
+def full_representation_analysis_seeg_mixed_model(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=True, first_trials_to_remove=50, save_folder=None):
+    """Same electrode selection and data as full_representation_analysis_seeg, but instead of one regression per channel
+    followed by tests across channels, runs one mixed model per relationship with crossed random intercepts for
+    subjects, channels and stimulus identity (both repetitions of a stimulus share the same identity).
+    The 4 relationships are tested independently:
+        1. correct ~ intrastimulus correlation (logit link)
+        2. intrastimulus correlation ~ condition
+        3. correct ~ interstimulus distance (logit link)
+        4. interstimulus distance ~ condition
+    """
+
+    ############## Electrode selection (all electrodes of the regions) ##############
+
+    behavior_all = pd.read_csv(behavior_path)
+    subject_paths = sorted(list(Path(rms_path).glob('*epochs_rms.pkl')))
+    del subject_paths[1]
+
+    selected_electrodes = {}
+    for subject_path in subject_paths:
+        subject_name = Path(subject_path).name[:6]
+        rms_obj = np.load(subject_path, allow_pickle=True)
+        parcellations = rms_obj['ch_parcellations']
+        if first_parcel_label == True:
+            parcellations = [[parcel[0]] for parcel in parcellations]
+        elif first_parcel_label == "advanced":
+            go_next = ['Unknown', 'ctx-rh-unknown', 'ctx-lh-unknown']
+            parcellations = select_parcel(parcellations, go_next)
+        selected_electrodes[subject_name] = np.unique([
+            rms_obj['ch_names'][c] for c in range(len(rms_obj['ch_names']))
+            if any(ch_parcel in region for region in regions for ch_parcel in parcellations[c])]).tolist()
+    print(selected_electrodes)
+
+    ############## Long format data ##############
+
+    stim_features = behavior_all[['stim_name', 'subject', condition, 'correct']]
+
+    def stim_identity(stim):
+        return stim[9:].replace('rep1', '').replace('rep2', '')
+
+    def build_long_data(data, representation):
+        """representation: 'intrastim' (correlation between the 2 reps) or 'interstim' (mean distance to previous trials)"""
+        frames = []
+        for s, subject in enumerate(data['subjects']):
+            if subject == 'Bou_Ni' or subject not in selected_electrodes:
+                continue
+            subject_stim_features = stim_features[stim_features['subject'] == subject].drop_duplicates('stim_name').set_index('stim_name')
+            ch_names = data['info'][s]['ch_names']
+            stim_names = list(data['stim_names'][s])
+            names_without_trial_nb = [name[9:] for name in stim_names]
+            matrix = data['similarity_matrices'][s] if representation == 'intrastim' else data['distance_matrices'][s]
+
+            indices, values = [], []
+            for i, stim in enumerate(stim_names):
+                if i <= first_trials_to_remove or stim not in subject_stim_features.index:
+                    continue
+                if np.isnan(subject_stim_features.at[stim, 'correct']):
+                    continue
+                if representation == 'intrastim':
+                    other = stim[9:].replace('rep1', 'rep2') if 'rep1' in stim else stim[9:].replace('rep2', 'rep1')
+                    if not (stim[9:].replace('rep2', 'rep1') in names_without_trial_nb and stim[9:].replace('rep1', 'rep2') in names_without_trial_nb):
+                        continue
+                    values.append(matrix[i, names_without_trial_nb.index(other), :])
+                else:
+                    if not ('rep1' in stim or 'rep2' in stim):
+                        continue
+                    mask = np.zeros(matrix.shape[1], dtype=bool)
+                    mask[:i] = True  # previous trials only
+                    values.append(np.mean(matrix[i, mask, :], axis=0))
+                indices.append(i)
+            if len(indices) == 0:
+                continue
+            values = np.array(values)
+            stims = [stim_names[i] for i in indices]
+            correct = subject_stim_features.loc[stims, 'correct'].to_numpy()
+            feature = subject_stim_features.loc[stims, condition].to_numpy(dtype=float)
+            feature = (feature - np.nanmean(feature)) / np.nanstd(feature)
+            for c, ch_name in enumerate(ch_names):
+                if ch_name not in selected_electrodes[subject]:
+                    continue
+                rep = values[:, c]
+                frames.append(pd.DataFrame({
+                    'subject': subject, 'channel': f'{subject}_{ch_name}',
+                    'stim': [stim_identity(stim) for stim in stims],
+                    'correct': correct, 'feature': feature,
+                    'representation': (rep - rep.mean()) / rep.std()}))
+        return pd.concat(frames, ignore_index=True).dropna()
+
+    ############## Mixed models ##############
+
+    analyses = [
+        ('intrastim', 'correct', 'representation', True, 'greater', 'correct ~ intrastimulus correlation'),
+        ('intrastim', 'representation', 'feature', False, 'less', f'intrastimulus correlation ~ {condition}'),
+        ('interstim', 'correct', 'representation', True, 'greater', 'correct ~ interstimulus distance'),
+        ('interstim', 'representation', 'feature', False, 'greater', f'interstimulus distance ~ {condition}'),
+    ]
+    long_data = {
+        'intrastim': build_long_data(np.load(similarity_path, allow_pickle=True), 'intrastim'),
+        'interstim': build_long_data(np.load(distance_path, allow_pickle=True), 'interstim'),
+    }
+
+    if save_folder is not None:
+        save_folder = Path(save_folder)
+        save_folder.mkdir(parents=True, exist_ok=True)
+        for representation, df in long_data.items():
+            df.to_csv(save_folder / f'{representation}_long_data.csv', index=False)
+        r_script = save_folder / 'mixed_models.R'
+        r_script.write_text(
+            'library(lme4)\nlibrary(lmerTest)  # p-values for lmer\n\n'
+            'load_data <- function(file) {\n'
+            '  df <- read.csv(file)\n'
+            '  df$subject <- factor(df$subject); df$channel <- factor(df$channel); df$stim <- factor(df$stim)\n'
+            '  df\n}\n'
+            'intra <- load_data("intrastim_long_data.csv")\n'
+            'inter <- load_data("interstim_long_data.csv")\n'
+            'ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))\n\n'
+            '# channel labels already include the subject, so (1|channel) is nested within subject\n'
+            '# columns: correct (0/1), feature (z-scored condition), representation (z-scored within channel)\n\n'
+            '# 1. correct ~ intrastimulus correlation (one-sided: greater)\n'
+            'm1 <- glmer(correct ~ representation + (1|subject) + (1|channel) + (1|stim), data = intra, family = binomial, control = ctrl)\n'
+            '# 2. intrastimulus correlation ~ condition (one-sided: less)\n'
+            'm2 <- lmer(representation ~ feature + (1|subject) + (1|channel) + (1|stim), data = intra)\n'
+            '# 3. correct ~ interstimulus distance (one-sided: greater)\n'
+            'm3 <- glmer(correct ~ representation + (1|subject) + (1|channel) + (1|stim), data = inter, family = binomial, control = ctrl)\n'
+            '# 4. interstimulus distance ~ condition (one-sided: greater)\n'
+            'm4 <- lmer(representation ~ feature + (1|subject) + (1|channel) + (1|stim), data = inter)\n\n'
+            'for (m in list(m1, m2, m3, m4)) print(summary(m))\n'
+            '# one-sided p from the z / t value of the slope: pnorm(z, lower.tail = FALSE) for "greater", pnorm(z) for "less"\n')
+        print(f'Saved long data and R script to {save_folder}')
+
+    results = {}
+    for representation, outcome, predictor, binary, alternative, label in analyses:
+        df = long_data[representation]
+        print(f'{label}: {len(df)} observations, {df["subject"].nunique()} subjects, {df["channel"].nunique()} channels, {df["stim"].nunique()} stimuli')
+        beta, se, z = fit_crossed_mixed_model(df, outcome, predictor, binary)
+        if alternative == 'greater':
+            pvalue = scipy.stats.norm.sf(z)
+        elif alternative == 'less':
+            pvalue = scipy.stats.norm.cdf(z)
+        else:
+            pvalue = 2 * scipy.stats.norm.sf(abs(z))
+        print(f'{label}: beta = {beta:.4g}, se = {se:.4g}, z = {z:.3f}, one-sided p ({alternative}) = {pvalue:.4g}')
+        results[label] = {'beta': beta, 'se': se, 'z': z, 'pvalue': pvalue, 'alternative': alternative}
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    labels = list(results.keys())
+    ax.barh(labels, [results[l]['beta'] for l in labels], xerr=[1.96 * results[l]['se'] for l in labels])
+    ax.axvline(0, ls='--', color='k')
+    for k, l in enumerate(labels):
+        ax.text(0.01, k, f'p={results[l]["pvalue"]:.3g}', transform=ax.get_yaxis_transform(), va='center')
+    ax.set_xlabel('Fixed effect (logit scale for correct, standardized units otherwise)')
+    plt.tight_layout()
+    plt.show()
+    return results
+
+
+def full_representation_analysis_seeg_rms_control(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=True, permutations=0):
+    """Takes all electrodes from a big region (ex: all temporal lobe) and selected the subset of electrodes that show a
+    significant RMS contrast (in either novelty detection or retrieval), then run intra and inter stimulus correlation
+    analysis, linking them to correct response and surprise"""
+
+    ############## Electrode selection based on RMS contrast ##############
+
+    behavior_all = pd.read_csv(behavior_path)
+    path = Path(rms_path)
+    subject_paths = sorted(list(path.glob(f'*epochs_rms.pkl')))
+    subject_names = []
+    del subject_paths[1]
+    print(subject_paths)
+
+    significant_electrodes = {}  # dict of signif electrodes by subject
+    rms_by_subject = {}  # RMS control values (epochs x channels) with epoch names and channel names
+
+    for i, subject_path in enumerate(tqdm(subject_paths)):
+        subject_name = Path(subject_path).name[:6]
+        subject_names.append(subject_name)
+        behavior = behavior_all[behavior_all['subject'] == subject_name]
+        correct_novelty = behavior[(behavior['correct'] == 1) & (behavior['rep1'] == 1)]['stim_name'].tolist()
+        incorrect_novelty = behavior[(behavior['correct'] == 0) & (behavior['rep1'] == 1)]['stim_name'].tolist()
+        correct_retrieval = behavior[(behavior['correct'] == 1) & (behavior['rep2'] == 1)]['stim_name'].tolist()
+        incorrect_retrieval = behavior[(behavior['correct'] == 0) & (behavior['rep2'] == 1)]['stim_name'].tolist()
+
+        rms_obj = np.load(subject_path, allow_pickle=True)
+        rms = rms_obj['rms']
+        rms_by_subject[subject_name] = {'rms': rms, 'stim_name': list(rms_obj['stim_name']),
+                                        'ch_names': list(rms_obj['ch_names'])}
+        parcellations = rms_obj['ch_parcellations']
+        if first_parcel_label == True:
+            parcellations = [[parcel[0]] for parcel in parcellations]
+        elif first_parcel_label == "advanced":
+            go_next = ['Unknown', 'ctx-rh-unknown', 'ctx-lh-unknown']
+            parcellations = select_parcel(parcellations, go_next)
+        # print(np.array(rms_obj['ch_names']))
+
+        significant_electrodes[subject_name] = []
+        for cond, correct_incorrect in enumerate([[correct_novelty, incorrect_novelty], [correct_retrieval, incorrect_retrieval]]):
+        # for cond, correct_incorrect in enumerate([[correct_novelty, incorrect_novelty]]):
+        # for cond, correct_incorrect in enumerate([[correct_retrieval, incorrect_retrieval]]):
+            correct = [e for e in range(len(rms_obj['stim_name'])) if rms_obj['stim_name'][e] in correct_incorrect[0]]
+            incorrect = [e for e in range(len(rms_obj['stim_name'])) if rms_obj['stim_name'][e] in correct_incorrect[1]]
+            if (len(correct) > 0) & (len(incorrect) > 0):
+                for c in range(rms.shape[1]):
+                    for region in regions:
+                        if any(ch_parcel in region for ch_parcel in parcellations[c]):
+                            # pval = ttest_ind(rms[correct, c], rms[incorrect, c], axis=0, equal_var=False,
+                            #                                permutations=10000, random_state=None,
+                            #                                alternative='greater').pvalue  # testing of individual electrodes
+                            # if pval < 0.05:
+                            significant_electrodes[subject_name].append(rms_obj['ch_names'][c])
+        significant_electrodes[subject_name] = np.unique(significant_electrodes[subject_name]).tolist()  # keep each electrode only once
+
+    print(significant_electrodes)
+    chan_count = 0
+    for subject in significant_electrodes:
+        chan_count += len(significant_electrodes[subject])
+    print(chan_count)
+
+
+    ############## Representation analysis ##############
+
+    # initialize random seed for permutations
+    rng = np.random.default_rng(seed=32)
+
+    # define the function that will be used for regressions (as well as permuted regressions)
+    def get_rms_array(subject_name, stim_list, subject_ch_names):
+        """RMS (epochs x channels) aligned with the trials in stim_list and the channels in subject_ch_names"""
+        rms_info = rms_by_subject[subject_name]
+        stim_index = {stim: idx for idx, stim in enumerate(rms_info['stim_name'])}
+        ch_index = {ch: idx for idx, ch in enumerate(rms_info['ch_names'])}
+        rms_array = np.full((len(stim_list), len(subject_ch_names)), np.nan)
+        for t, stim in enumerate(stim_list):
+            if stim in stim_index:
+                for c, ch in enumerate(subject_ch_names):
+                    if ch in ch_index:
+                        rms_array[t, c] = rms_info['rms'][stim_index[stim], ch_index[ch]]
+        return rms_array
+
+    def run_regressions(representation_array, rms_array):
+        """representation_array contains intrastim correlation or interstim distance. rms_array (same shape) is the
+        RMS of the same channel and epoch, used as a control predictor in the logistic regression"""
+        param_correct_list = []
+        param_feature_list = []
+        channel_positions = []
+        subject_id_list = []
+        for channel in range(representation_array.shape[1]):
+            if ch_names[channel] in significant_electrodes[subject]:
+                # Y = correlations_array[:, channel]
+                # all_correlations += Y.tolist()
+                # Y = (Y - Y.mean()) / Y.std()
+                # X = np.zeros((Y.shape[0], 1))
+                # # X = np.zeros((Y.shape[0], 2))
+                # X[:, 0] = correct_list
+                # # X[:, 1] = np.array(feature_list)**2
+                # X = sm.add_constant(X)
+
+                Y = np.array(correct_list)
+                X = np.zeros((Y.shape[0], 2))
+                X[:, 0] = representation_array[:, channel]
+                X[:, 1] = rms_array[:, channel]
+                X = (X - X.mean(axis=0)) / X.std(axis=0)
+                X = sm.add_constant(X)
+
+                # # independent t-test
+                # correct_corr = Y[X[:, 1] == 1]  # axis 0 is the intercept
+                # incorrect_corr = Y[X[:, 1] == 0]
+                # p_ttest[channel] = ttest_ind(correct_corr, incorrect_corr, axis=0, equal_var=False, permutations=1000,
+                #                              random_state=None,
+                #                              # alternative='greater').pvalue  # testing of individual electrodes
+                #                              alternative='less').pvalue  # testing of individual electrodes
+                # if p_ttest[channel] < 0.05:
+
+                # ols = sm.OLS(Y, X).fit()
+                ols = sm.Logit(Y, X).fit(disp=False)
+                param_correct_list.append(ols.params[1])
+                # pvalues[channel] = ols.pvalues[1]
+                # regression_param[channel] = ols.params[2]
+
+                Y = X[:, 1]
+                # X = np.zeros((Y.shape[0], 1))
+                X = np.zeros((Y.shape[0], 2))
+                X[:, 0] = feature_list
+                X[:, 1] = rms_array[:, channel]
+                # X[:, 1] = np.array(feature_list)**2
+                X = (X - X.mean(axis=0)) / X.std(axis=0)
+                X = sm.add_constant(X)
+                ols = sm.OLS(Y, X).fit()
+                param_feature_list.append(ols.params[1])
+                # regression_param_feature.append(ols.params[2])
+
+                channel_positions.append(subject_info['chs'][channel]['loc'][:3])
+                subject_id_list.append(s)
+        return param_correct_list, param_feature_list, channel_positions, subject_id_list
+
+
+    ############## Intrastim correlation -> correct ##############
+
+    stim_features = pd.read_csv(behavior_path)
+    stim_features = stim_features[['stim_name', 'subject', condition, "correct"]]
+    print(stim_features)
+
+    data = np.load(similarity_path, allow_pickle=True)
+
+    channel_positions_list = []
+    subject_id = []
+    regression_param_correct = []
+    regression_param_feature = []
+    permuted_regression_param_correct = [[] for _ in range(permutations)]
+    permuted_regression_param_feature = [[] for _ in range(permutations)]
+    regression_param_correct_subject_mean = []
+    regression_param_feature_subject_mean = []
+    # pvalues_array = []  # p value for the regression
+    p_ttest_array = []  # p value of the contrast correct vs incorrect
+
+    for s, subject in tqdm(enumerate(data["subjects"])):
+        if subject != 'Bou_Ni':
+            subject_stim_features = stim_features[stim_features['subject'] == subject]
+            subject_info = data['info'][s]
+            ch_names = subject_info['ch_names']
+            indices_to_keep = []
+            correct_list = []
+            feature_list = []
+            correlations_array = []
+            stim_names_without_trial_nb = [data['stim_names'][s][i][9:] for i in range(len(data['stim_names'][s]))]
+            similarity_matrix = data['similarity_matrices'][s]  # keep all channels
+            # similarity_matrix = data['distance_matrices'][s]  # keep all channels
+            # similarity_matrix = 1/similarity_matrix
+
+            # plt.figure()
+            # plt.hist(subject_stim_features[condition], bins=100)
+            # plt.show()
+
+            first_trials_to_remove = 50
+            for i, stim in enumerate(data['stim_names'][s]):
+                if i > first_trials_to_remove:  # remove first trials
+                    if stim in subject_stim_features['stim_name'].tolist():
+                        # if 'rep2' in stim:
+                        if not np.isnan(subject_stim_features[subject_stim_features['stim_name'] == stim]["correct"].iloc[0]):
+                            if (stim[9:].replace('rep2', 'rep1') in stim_names_without_trial_nb) & (stim[9:].replace('rep1', 'rep2') in stim_names_without_trial_nb):  # check that both reps are in the data
+                                indices_to_keep.append(i)
+                                correct_list.append(subject_stim_features[subject_stim_features['stim_name'] == stim]["correct"].iloc[0])
+                                feature_list.append(subject_stim_features[subject_stim_features['stim_name'] == stim][condition].iloc[0])
+                                if 'rep1' in stim:
+                                    rep_index = stim_names_without_trial_nb.index(stim[9:].replace('rep1', 'rep2'))
+                                elif 'rep2' in stim:
+                                    rep_index = stim_names_without_trial_nb.index(stim[9:].replace('rep2', 'rep1'))
+                                else:
+                                    raise ValueError
+                                correlations_array.append(similarity_matrix[i, rep_index, :])  # correlation of 2 reps
+
+            correlations_array = np.array(correlations_array)
+            rms_array = get_rms_array(subject, [data['stim_names'][s][i] for i in indices_to_keep], ch_names)
+
+            # pvalues = np.zeros(correlations_array.shape[1])
+            p_ttest = np.zeros(correlations_array.shape[1])
+
+            param_correct_list, param_feature_list, channel_positions, subject_id_list = run_regressions(correlations_array, rms_array)
+            regression_param_correct += param_correct_list
+            regression_param_feature += param_feature_list
+            channel_positions_list += channel_positions
+            subject_id += subject_id_list
+
+            # pvalues_array.append(pvalues)
+            # p_ttest_array.append(p_ttest)
+
+            # store subject average
+            regression_param_correct_subject_mean.append(np.mean(param_correct_list))
+            regression_param_feature_subject_mean.append(np.mean(param_feature_list))
+
+            # run permutations
+            if permutations > 0:
+                print(f'Subject {s}, running permutations...')
+                for perm in tqdm(range(permutations)):
+                    permuted_correlations_array = rng.permutation(correlations_array, axis=0)  # shuffle trials in the same way for each channel, which keeps the data structure (correlation between channels within subjects)
+                    param_correct_list, param_feature_list, _, _ = run_regressions(permuted_correlations_array, rms_array)
+                    permuted_regression_param_correct[perm] += param_correct_list
+                    permuted_regression_param_feature[perm] += param_feature_list
+
+    regression_param_correct = np.array(regression_param_correct)
+    print(regression_param_correct.shape)
+    regression_param_feature = np.array(regression_param_feature)
+    print(regression_param_feature.shape)
+    permuted_regression_param_correct = np.array(permuted_regression_param_correct)
+    print(permuted_regression_param_correct.shape)
+    permuted_regression_param_feature = np.array(permuted_regression_param_feature)
+    print(permuted_regression_param_feature.shape)
+    regression_param_correct_subject_mean = np.array(regression_param_correct_subject_mean)
+    regression_param_feature_subject_mean = np.array(regression_param_feature_subject_mean)
+
+    # pvalues_array = np.concatenate(pvalues_array)
+    # print(np.sum(pvalues_array < 0.05), 'significant electrodes,',
+    #       round(np.sum(pvalues_array < 0.05) / pvalues_array.shape[0] * 100, 3), "%")
+    # print(regression_param_array[pvalues_array < 0.05])
+    # p_ttest_array = np.concatenate(p_ttest_array)
+    # print(np.sum(p_ttest_array < 0.05), 'significant electrodes with independent ttest,',
+    #       round(np.sum(p_ttest_array < 0.05) / p_ttest_array.shape[0] * 100, 3), "%")
+    # print(regression_param_array[p_ttest_array < 0.05])
+
+    list_of_pvalues = []
+
+    fig, axs = plt.subplots(1, 2, sharey=True)
+    x_regression = ['correct ~ intrastimulus correlation', f'intrastimulus correlation ~ {condition}']
+    alternative = ['greater', 'less']
+    # alternative = ['greater', 'two-sided']
+    permuted_regression_param_array = [permuted_regression_param_correct, permuted_regression_param_feature]
+    regression_param_array_subject_mean = [regression_param_correct_subject_mean, regression_param_feature_subject_mean]
+    for i, regression_param_array in enumerate([regression_param_correct, regression_param_feature]):
+        print(np.mean(regression_param_array))
+
+        # classical t-test (does not account for channel covariance within subjects)
+        ttest = scipy.stats.ttest_1samp(regression_param_array, 0, alternative=alternative[i])
+        print('ttest channel level:', ttest)
+        list_of_pvalues.append(ttest.pvalue)
+
+        # permuted t-test based on sign flips (can be too conservative)
+        pval_permut = permut_1sample_ttest_across_channels(regression_param_array, subject_id, popmean=0, alternative=alternative[i], n_permutations=1000)
+        print('pval_permut:', pval_permut)
+        # list_of_pvalues.append(pval_permut)
+
+        # permuted t-test bases on shuffling of neural representation values across trials (should be more powerful)
+        pval_permut_representation = already_permuted_1sample_ttest_across_channels(regression_param_array, permuted_regression_param_array[i], popmean=0, alternative=alternative[i])
+        print('pval_permut_representation:', pval_permut_representation)
+        # list_of_pvalues.append(pval_permut_representation)
+
+        # t-test at the subject level
+        ttest = scipy.stats.ttest_1samp(regression_param_array_subject_mean[i], 0, alternative=alternative[i])
+        print('ttest subject level:', ttest)
+        # list_of_pvalues.append(ttest.pvalue)
+
+        axs[i].hist(regression_param_array, bins=100)
+        axs[i].axvline(0, ls='--', color='k')
+        axs[i].axvline(np.mean(regression_param_array), color='r', lw=2)
+        # plt.xlabel('Regression parameter (intrastimulus correlation ~ surprise)')
+        # axs[i].set_xlabel(f'Regression parameter (intrastimulus correlation ~ {x_regression[i]})')
+        axs[i].set_xlabel(f'Regression parameter ({x_regression[i]})')
+        axs[i].set_ylabel('Count (electrode)')
+        axs[i].text(plt.gca().get_xlim()[0], plt.gca().get_ylim()[1],
+                 f'regression beta = {round(np.mean(regression_param_array), 5)}, p = {round(ttest.pvalue, 5)}')
+
+    fig, axs = plt.subplots(2, 3, sharey='row')
+    for i, regression_param_array in enumerate([regression_param_correct, regression_param_feature]):
+        dimensions = ['left-right (abs: distance from center)', 'posterior-anterior', 'ventral-dorsal']
+        subject_colors = plt.get_cmap('Set3').colors
+        colors = [subject_colors[s] for s in subject_id]
+        for d, dimension_name in enumerate(dimensions):
+            dim = [positions[d] for positions in channel_positions_list]
+            if d == 0:
+                dim = np.abs(dim)  # for left-right, we transform position to distance from center
+            axs[i, d].scatter(dim, regression_param_array, color=colors)
+            axs[i, d].set_xlabel(dimension_name)
+
+            # Create a DataFrame for the mixed model
+            data_dict = {
+                'Value': regression_param_array,
+                'Position': dim,
+                'SubjectID': subject_id
+            }
+            model_data = pd.DataFrame(data_dict)
+            model = MixedLM.from_formula('Value ~ Position', groups='SubjectID', data=model_data)
+            result = model.fit()
+            p_value = result.pvalues['Position']
+
+            # fitted line
+            x_vals = np.linspace(min(dim), max(dim), 100)
+            y_vals = result.params['Intercept'] + result.params['Position'] * x_vals
+            axs[i, d].plot(x_vals, y_vals, color='k', linestyle='--', linewidth=1.5)
+
+            box_color = 'r' if p_value < 0.05 else 'white'
+            axs[i, d].text(
+                0.05, 0.95, f'p={p_value:.3g}', transform=axs[i, d].transAxes,
+                fontsize=10, verticalalignment='top', bbox=dict(boxstyle="round", facecolor=box_color, alpha=0.8)
+            )
+        axs[i, 0].set_ylabel(f'Regression parameter (intrastimulus correlation ~ {x_regression[i]})')
+
+    # plt.show()
+
+    intrastim_params = regression_param_correct.copy()
+    intrastim_feature_params = regression_param_feature.copy()
+
+
+    ############## Interstim correlation -> incorrect ##############
+
+    stim_features = pd.read_csv(behavior_path)
+    stim_features = stim_features[['stim_name', 'subject', condition, "correct"]]
+    print(stim_features)
+
+    data = np.load(distance_path, allow_pickle=True)
+
+    channel_positions_list = []
+    subject_id = []
+    regression_param_correct = []
+    regression_param_feature = []
+    permuted_regression_param_correct = [[] for _ in range(permutations)]
+    permuted_regression_param_feature = [[] for _ in range(permutations)]
+    regression_param_correct_subject_mean = []
+    regression_param_feature_subject_mean = []
+    # pvalues_array = []  # p value for the regression
+    # p_ttest_array = []  # p value of the contrast correct vs incorrect
+    distance_window_size = 50
+    for s, subject in tqdm(enumerate(data["subjects"])):
+        if not subject == 'Bou_Ni':
+            subject_stim_features = stim_features[stim_features['subject'] == subject]
+            subject_info = data['info'][s]
+            ch_names = subject_info['ch_names']
+            indices_to_keep = []
+            correct_list = []
+            feature_list = []
+            stim_names_without_trial_nb = [data['stim_names'][s][i][9:] for i in range(len(data['stim_names'][s]))]
+            # similarity_matrix = data['similarity_matrices'][s]  # keep all channels
+            # similarity_matrix = 1-similarity_matrix  # transform into interstim distance
+            # similarity_matrix = similarity_matrix**2  # transform into interstim distance
+            # similarity_matrix = 1/similarity_matrix**2  # transform into interstim distance
+            similarity_matrix = data['distance_matrices'][s]  # keep all channels
+            paired_stim = []
+            for i, stim in enumerate(data['stim_names'][s]):
+                if i > first_trials_to_remove:  # remove first trials
+                    if ('rep1' in stim) | ('rep2' in stim):
+                    # if 'rep2' in stim:
+                        if stim in subject_stim_features['stim_name'].tolist():
+                            if not np.isnan(subject_stim_features[subject_stim_features['stim_name'] == stim]["correct"].iloc[0]):
+                                # if subject_stim_features[subject_stim_features['stim_name'] == stim][condition].iloc[0] < 0.15:  # check that it works without extreme trials
+                                indices_to_keep.append(i)
+                                correct_list.append(subject_stim_features[subject_stim_features['stim_name'] == stim]["correct"].iloc[0])
+                                feature_list.append(subject_stim_features[subject_stim_features['stim_name'] == stim][condition].iloc[0])
+                                if 'rep2' in stim:
+                                    # indices_to_keep.append(i)
+                                    # correct_list.append(subject_stim_features[subject_stim_features['stim_name'] == stim]["correct"].iloc[0])
+                                    # feature_list.append(subject_stim_features[subject_stim_features['stim_name'] == stim][condition].iloc[0])
+                                    if stim[9:].replace('rep2', 'rep1') in stim_names_without_trial_nb:
+                                        paired_stim.append(stim_names_without_trial_nb.index(stim[9:].replace('rep2', 'rep1')))
+                                    else:
+                                        paired_stim.append('no_pair')
+                                if 'rep1' in stim:
+                                    # indices_to_keep.append(i)
+                                    # correct_list.append(subject_stim_features[subject_stim_features['stim_name'] == stim]["correct"].iloc[0])
+                                    # feature_list.append(subject_stim_features[subject_stim_features['stim_name'] == stim][condition].iloc[0])
+                                    if stim[9:].replace('rep1', 'rep2') in stim_names_without_trial_nb:
+                                        paired_stim.append(stim_names_without_trial_nb.index(stim[9:].replace('rep1', 'rep2')))
+                                    else:
+                                        paired_stim.append('no_pair')
+                                # else:
+                                #     raise ValueError('Neither rep1 nor rep2???')
+            # plt.imshow(np.mean(similarity_matrix, axis=-1), cmap='gray')
+            # plt.show()
+            condition_matrix = similarity_matrix[indices_to_keep, :, :]  # select condition
+            # condition_matrix = condition_matrix[:, indices_to_keep, :]  # select condition
+            correlations_array = np.zeros((condition_matrix.shape[0], condition_matrix.shape[2]))
+            for i in range(condition_matrix.shape[0]):
+                current_corr = condition_matrix[i, :, :]
+                mask = np.ones(condition_matrix.shape[1], dtype=bool)
+                mask[indices_to_keep[i]] = False  # remove current stim
+                # mask[i] = False  # remove current stim
+                # if not paired_stim[i] == 'no_pair':
+                #     mask[paired_stim[i]] = False  # remove pair
+                # for j in range(indices_to_keep[i], mask.shape[0]):
+                #     mask[j] = False  # remove following trials
+                mask[indices_to_keep[i]:] = False  # remove following trials
+                # mask[:indices_to_keep[i]-distance_window_size] = False  # only keep trials within a window before the current trial
+                # plt.hist(current_corr[mask, 10], bins=100)
+                # plt.show()
+                # print(np.mean(current_corr[mask, :], axis=0))
+                # print(current_corr.shape)
+                # print(mask)
+                # print(current_corr[mask, :].shape)
+                correlations_array[i, :] = np.mean(current_corr[mask, :], axis=0)
+            # print(correlations_array.shape)
+            # plt.figure()
+            # plt.plot(correlations_array)
+            # plt.show()
+
+            rms_array = get_rms_array(subject, [data['stim_names'][s][i] for i in indices_to_keep], ch_names)
+
+            # pvalues = np.zeros(correlations_array.shape[1])
+            # p_ttest = np.zeros(correlations_array.shape[1])
+
+            param_correct_list, param_feature_list, channel_positions, subject_id_list = run_regressions(correlations_array, rms_array)
+            regression_param_correct += param_correct_list
+            regression_param_feature += param_feature_list
+            channel_positions_list += channel_positions
+            subject_id += subject_id_list
+
+            # pvalues_array.append(pvalues)
+            # p_ttest_array.append(p_ttest)
+
+            # store subject average
+            regression_param_correct_subject_mean.append(np.mean(param_correct_list))
+            regression_param_feature_subject_mean.append(np.mean(param_feature_list))
+
+            # run permutations
+            if permutations > 0:
+                print(f'Subject {s}, running permutations...')
+                for perm in tqdm(range(permutations)):
+                    permuted_correlations_array = rng.permutation(correlations_array, axis=0)  # shuffle trials in the same way for each channel, which keeps the data structure (correlation between channels within subjects)
+                    param_correct_list, param_feature_list, _, _ = run_regressions(permuted_correlations_array, rms_array)
+                    permuted_regression_param_correct[perm] += param_correct_list
+                    permuted_regression_param_feature[perm] += param_feature_list
+
+    regression_param_correct = np.array(regression_param_correct)
+    print(regression_param_correct.shape)
+    regression_param_feature = np.array(regression_param_feature)
+    print(regression_param_feature.shape)
+    permuted_regression_param_correct = np.array(permuted_regression_param_correct)
+    print(permuted_regression_param_correct.shape)
+    permuted_regression_param_feature = np.array(permuted_regression_param_feature)
+    print(permuted_regression_param_feature.shape)
+    regression_param_correct_subject_mean = np.array(regression_param_correct_subject_mean)
+    regression_param_feature_subject_mean = np.array(regression_param_feature_subject_mean)
+
+    # pvalues_array = np.concatenate(pvalues_array)
+    # print(np.sum(pvalues_array < 0.05), 'significant electrodes,',
+    #       round(np.sum(pvalues_array < 0.05) / pvalues_array.shape[0] * 100, 3), "%")
+    # print(regression_param_array[pvalues_array < 0.05])
+    # p_ttest_array = np.concatenate(p_ttest_array)
+    # print(np.sum(p_ttest_array < 0.05), 'significant electrodes with independent ttest,',
+    #       round(np.sum(p_ttest_array < 0.05) / p_ttest_array.shape[0] * 100, 3), "%")
+    # print(regression_param_array[p_ttest_array < 0.05])
+
+    fig, axs = plt.subplots(1, 2, sharey=True, figsize=(10, 5))
+    x_regression = ['correct ~ interstimulus distance', f'interstimulus distance ~ {condition}']
+    alternative = ['greater', 'greater']
+    # alternative = ['greater', 'two-sided']
+    permuted_regression_param_array = [permuted_regression_param_correct, permuted_regression_param_feature]
+    regression_param_array_subject_mean = [regression_param_correct_subject_mean, regression_param_feature_subject_mean]
+    for i, regression_param_array in enumerate([regression_param_correct, regression_param_feature]):
+        print(np.mean(regression_param_array))
+
+        # classical t-test (does not account for channel covariance within subjects)
+        ttest = scipy.stats.ttest_1samp(regression_param_array, 0, alternative=alternative[i])
+        print('ttest channel level:', ttest)
+        list_of_pvalues.append(ttest.pvalue)
+
+        # permuted t-test based on sign flips (can be too conservative)
+        pval_permut = permut_1sample_ttest_across_channels(regression_param_array, subject_id, popmean=0, alternative=alternative[i], n_permutations=1000)
+        print('pval_permut:', pval_permut)
+        # list_of_pvalues.append(pval_permut)
+
+        # permuted t-test bases on shuffling of neural representation values across trials (should be more powerful)
+        pval_permut_representation = already_permuted_1sample_ttest_across_channels(regression_param_array, permuted_regression_param_array[i], popmean=0, alternative=alternative[i])
+        print('pval_permut_representation:', pval_permut_representation)
+        # list_of_pvalues.append(pval_permut_representation)
+
+        # t-test at the subject level
+        ttest = scipy.stats.ttest_1samp(regression_param_array_subject_mean[i], 0, alternative=alternative[i])
+        print('ttest subject level:', ttest)
+        # list_of_pvalues.append(ttest.pvalue)
+
+        axs[i].hist(regression_param_array, bins=100)
+        axs[i].axvline(0, ls='--', color='k')
+        axs[i].axvline(np.mean(regression_param_array), color='r', lw=2)
+        # plt.xlabel('Regression parameter (intrastimulus correlation ~ surprise)')
+        axs[i].set_xlabel(f'Regression parameter ({x_regression[i]})')
+        axs[i].set_ylabel('Count (electrode)')
+        axs[i].text(plt.gca().get_xlim()[0], plt.gca().get_ylim()[1],
+                    f'regression beta = {round(np.mean(regression_param_array), 5)}, p = {round(ttest.pvalue, 5)}')
+
+    fig, axs = plt.subplots(2, 3, sharey='row')
+    for i, regression_param_array in enumerate([regression_param_correct, regression_param_feature]):
+        dimensions = ['left-right (abs: distance from center)', 'posterior-anterior', 'ventral-dorsal']
+        subject_colors = plt.get_cmap('Set3').colors
+        colors = [subject_colors[s] for s in subject_id]
+        for d, dimension_name in enumerate(dimensions):
+            dim = [positions[d] for positions in channel_positions_list]
+            if d == 0:
+                dim = np.abs(dim)  # for left-right, we transform position to distance from center
+            axs[i, d].scatter(dim, regression_param_array, color=colors)
+            axs[i, d].set_xlabel(dimension_name)
+
+            # Create a DataFrame for the mixed model
+            data_dict = {
+                'Value': regression_param_array,
+                'Position': dim,
+                'SubjectID': subject_id
+            }
+            model_data = pd.DataFrame(data_dict)
+            model = MixedLM.from_formula('Value ~ Position', groups='SubjectID', data=model_data)
+            result = model.fit()
+            p_value = result.pvalues['Position']
+
+            # fitted line
+            x_vals = np.linspace(min(dim), max(dim), 100)
+            y_vals = result.params['Intercept'] + result.params['Position'] * x_vals
+            axs[i, d].plot(x_vals, y_vals, color='k', linestyle='--', linewidth=1.5)
+
+            box_color = 'r' if p_value < 0.05 else 'white'
+            axs[i, d].text(
+                0.05, 0.95, f'p={p_value:.3g}', transform=axs[i, d].transAxes,
+                fontsize=10, verticalalignment='top', bbox=dict(boxstyle="round", facecolor=box_color, alpha=0.8)
+            )
+        axs[i, 0].set_ylabel(f'Regression parameter (interstimulus distance ~ {x_regression[i]})')
+
+    interstim_params = regression_param_correct
+
+    person_corr = pearsonr(intrastim_params, interstim_params, alternative='two-sided')
+    print('Correlation test')
+    print(person_corr)
+    spearman_corr = spearmanr(intrastim_params, interstim_params, alternative='two-sided')
+    print('Spearman')
+    print(spearman_corr)
+
+    # intrastim vs interstim
+    # subject_colors = plt.get_cmap('Set3').colors
+    subject_colors = ['lightgray' for s in range(len(subject_id))]
+    colors = [subject_colors[s] for s in subject_id]
+    fig, axs = plt.subplots(1, 1, figsize=(5.2, 5))
+    axs.scatter(intrastim_params, interstim_params, color=colors, s=12, alpha=0.3)
+    axs.set_xlabel('\u03B2 (correct ~ intrastimulus correlation)', fontsize=13)
+    axs.set_ylabel('\u03B2 (correct ~ interstimulus distance)', fontsize=13)
+    axs.tick_params(axis='y', labelsize=13)
+    axs.tick_params(axis='x', labelsize=13)
+    axs.axvline(0, ls='--', color='k')
+    axs.axhline(0, ls='--', color='k')
+
+    # Create a DataFrame for the mixed model
+    data_dict = {
+        'intrastim_params': intrastim_params,
+        'interstim_params': interstim_params,
+        'SubjectID': subject_id
+    }
+    model_data = pd.DataFrame(data_dict)
+    model = MixedLM.from_formula('interstim_params ~ intrastim_params', groups='SubjectID', data=model_data)
+    result = model.fit()
+    print(result.summary())
+    p_value = result.pvalues['intrastim_params']
+
+    x_vals = np.linspace(min(intrastim_params), max(intrastim_params), 100)
+    y_vals = result.params['Intercept'] + result.params['intrastim_params'] * x_vals
+    axs.plot(x_vals, y_vals, color='k', linewidth=5, zorder=10)
+    # slope, intercept = np.polyfit(intrastim_params, interstim_params, 1)
+    # x_range = np.linspace(min(intrastim_params), max(intrastim_params), 100)
+    # axs.plot(x_range, slope * x_range + intercept, color='k', lw=2)
+
+    # # To plot a confidence interval
+    # cov_matrix = result.cov_params()
+    # var_intercept = cov_matrix.loc['Intercept', 'Intercept']
+    # var_slope = cov_matrix.loc['intrastim_params', 'intrastim_params']
+    # cov_intercept_slope = cov_matrix.loc['Intercept', 'intrastim_params']
+    # SE_y_vals = np.sqrt(var_intercept + (x_vals ** 2) * var_slope + 2 * x_vals * cov_intercept_slope)
+    # from scipy.stats import t
+    # t_crit = t.ppf(0.975, df=result.df_resid)  # t-value for 95% CI
+    # CI_upper = y_vals + t_crit * SE_y_vals
+    # CI_lower = y_vals - t_crit * SE_y_vals
+    # axs.fill_between(x_vals, CI_lower, CI_upper, color="red", alpha=0.2, label="95% CI")
+
+    unique_subjects = np.unique(subject_id)
+    for subj in unique_subjects:
+        mask = subject_id == subj
+        x_subj = intrastim_params[mask]
+        y_subj = interstim_params[mask]
+        slope, intercept = np.polyfit(x_subj, y_subj, 1)
+        x_range = np.linspace(min(x_subj), max(x_subj), 100)
+        axs.plot(x_range, slope * x_range + intercept, color=subject_colors[subj], lw=3, alpha=1)
+
+    # axs.text(0, axs.get_ylim()[1], f'rho = {round(spearman_corr.statistic, 2)}, p = {round(spearman_corr.pvalue, 5)}')
+    # axs.text(0, axs.get_ylim()[1], f"Beta = {round(result.params['intrastim_params'], 2)}, p = {round(p_value, 5)}")
+    plt.tight_layout()
+
+    fig, axs = plt.subplots(1, 1, figsize=(5, 5))
+    axs.scatter(intrastim_params, interstim_params, color='k', s=8)
+    axs.set_xlabel('Regression parameter (correct ~ intrastimulus correlation)')
+    axs.set_ylabel('Regression parameter (correct ~ interstimulus distance)')
+    axs.axvline(0, ls='--', color='k')
+    axs.axhline(0, ls='--', color='k')
+
+    slope, intercept = np.polyfit(intrastim_params, interstim_params, 1)
+    x_range = np.linspace(min(intrastim_params), max(intrastim_params), 100)
+    axs.plot(x_range, slope * x_range + intercept, color='k', lw=2)
+
+    axs.text(0, axs.get_ylim()[1], f'rho = {round(spearman_corr.statistic, 2)}, p = {round(spearman_corr.pvalue, 5)}')
+
+    # intrastim vs interstim surprise
+    fig, axs = plt.subplots(1, 1, figsize=(5.2, 5))
+    axs.scatter(intrastim_feature_params, regression_param_feature, color=colors, s=12, alpha=0.3)
+    axs.set_xlabel('\u03B2 (intrastimulus correlation ~ surprise)', fontsize=13)
+    axs.set_ylabel('\u03B2 (interstimulus distance ~ surprise)', fontsize=13)
+    axs.tick_params(axis='y', labelsize=13)
+    axs.tick_params(axis='x', labelsize=13)
+    axs.axvline(0, ls='--', color='k')
+    axs.axhline(0, ls='--', color='k')
+
+    # Create a DataFrame for the mixed model
+    data_dict = {
+        'interstim_feature_params': regression_param_feature,
+        'intrastim_feature_params': intrastim_feature_params,
+        'SubjectID': subject_id
+    }
+    model_data = pd.DataFrame(data_dict)
+    model = MixedLM.from_formula('interstim_feature_params ~ intrastim_feature_params', groups='SubjectID', data=model_data)
+    result = model.fit()
+    print(result.summary())
+    p_value = result.pvalues['intrastim_feature_params']
+
+    x_vals = np.linspace(min(intrastim_feature_params), max(intrastim_feature_params), 100)
+    y_vals = result.params['Intercept'] + result.params['intrastim_feature_params'] * x_vals
+    axs.plot(x_vals, y_vals, color='k', linewidth=5, zorder=10)
+    # slope, intercept = np.polyfit(intrastim_params, interstim_params, 1)
+    # x_range = np.linspace(min(intrastim_params), max(intrastim_params), 100)
+    # axs.plot(x_range, slope * x_range + intercept, color='k', lw=2)
+
+    unique_subjects = np.unique(subject_id)
+    for subj in unique_subjects:
+        mask = subject_id == subj
+        x_subj = intrastim_feature_params[mask]
+        y_subj = regression_param_feature[mask]
+        slope, intercept = np.polyfit(x_subj, y_subj, 1)
+        x_range = np.linspace(min(x_subj), max(x_subj), 100)
+        axs.plot(x_range, slope * x_range + intercept, color=subject_colors[subj], lw=3)
+
+    # axs.text(0, axs.get_ylim()[1], f'rho = {round(spearman_corr.statistic, 2)}, p = {round(spearman_corr.pvalue, 5)}')
+    # axs.text(0, axs.get_ylim()[1],
+    #          f"Beta = {round(result.params['intrastim_feature_params'], 2)}, p = {round(p_value, 5)}")
+    plt.tight_layout()
+
+    # intrastim correct and surprise
+    fig, axs = plt.subplots(1, 1, figsize=(5, 5))
+    axs.scatter(intrastim_feature_params, intrastim_params, color=colors, s=2, alpha=0.7)
+    axs.set_xlabel('Regression parameter (intrastimulus correlation ~ surprise)')
+    axs.set_ylabel('Regression parameter (correct ~ intrastimulus correlation)')
+    axs.axvline(0, ls='--', color='k')
+    axs.axhline(0, ls='--', color='k')
+
+    # Create a DataFrame for the mixed model
+    data_dict = {
+        'intrastim_params': intrastim_params,
+        'intrastim_feature_params': intrastim_feature_params,
+        'SubjectID': subject_id
+    }
+    model_data = pd.DataFrame(data_dict)
+    model = MixedLM.from_formula('intrastim_params ~ intrastim_feature_params', groups='SubjectID', data=model_data)
+    result = model.fit()
+    p_value = result.pvalues['intrastim_feature_params']
+
+    x_vals = np.linspace(min(intrastim_feature_params), max(intrastim_feature_params), 100)
+    y_vals = result.params['Intercept'] + result.params['intrastim_feature_params'] * x_vals
+    axs.plot(x_vals, y_vals, color='k', linewidth=4)
+    # slope, intercept = np.polyfit(intrastim_params, interstim_params, 1)
+    # x_range = np.linspace(min(intrastim_params), max(intrastim_params), 100)
+    # axs.plot(x_range, slope * x_range + intercept, color='k', lw=2)
+
+    unique_subjects = np.unique(subject_id)
+    for subj in unique_subjects:
+        mask = subject_id == subj
+        x_subj = intrastim_feature_params[mask]
+        y_subj = intrastim_params[mask]
+        slope, intercept = np.polyfit(x_subj, y_subj, 1)
+        x_range = np.linspace(min(x_subj), max(x_subj), 100)
+        axs.plot(x_range, slope * x_range + intercept, color=subject_colors[subj], lw=2)
+
+    # axs.text(0, axs.get_ylim()[1], f'rho = {round(spearman_corr.statistic, 2)}, p = {round(spearman_corr.pvalue, 5)}')
+    axs.text(0, axs.get_ylim()[1], f"Beta = {round(result.params['intrastim_feature_params'], 2)}, p = {round(p_value, 5)}")
+
+    # interstim correct and surprise
+    fig, axs = plt.subplots(1, 1, figsize=(5, 5))
+    axs.scatter(regression_param_feature, interstim_params, color=colors, s=2, alpha=0.7)
+    axs.set_xlabel('Regression parameter (interstimulus distance ~ surprise)')
+    axs.set_ylabel('Regression parameter (correct ~ interstimulus distance)')
+    axs.axvline(0, ls='--', color='k')
+    axs.axhline(0, ls='--', color='k')
+
+    # Create a DataFrame for the mixed model
+    data_dict = {
+        'interstim_params': interstim_params,
+        'interstim_feature_params': regression_param_feature,
+        'SubjectID': subject_id
+    }
+    model_data = pd.DataFrame(data_dict)
+    model = MixedLM.from_formula('interstim_params ~ interstim_feature_params', groups='SubjectID', data=model_data)
+    result = model.fit()
+    p_value = result.pvalues['interstim_feature_params']
+
+    x_vals = np.linspace(min(regression_param_feature), max(regression_param_feature), 100)
+    y_vals = result.params['Intercept'] + result.params['interstim_feature_params'] * x_vals
+    axs.plot(x_vals, y_vals, color='k', linewidth=4)
+    # slope, intercept = np.polyfit(intrastim_params, interstim_params, 1)
+    # x_range = np.linspace(min(intrastim_params), max(intrastim_params), 100)
+    # axs.plot(x_range, slope * x_range + intercept, color='k', lw=2)
+
+    unique_subjects = np.unique(subject_id)
+    for subj in unique_subjects:
+        mask = subject_id == subj
+        x_subj = regression_param_feature[mask]
+        y_subj = interstim_params[mask]
+        slope, intercept = np.polyfit(x_subj, y_subj, 1)
+        x_range = np.linspace(min(x_subj), max(x_subj), 100)
+        axs.plot(x_range, slope * x_range + intercept, color=subject_colors[subj], lw=2)
+
+    # axs.text(0, axs.get_ylim()[1], f'rho = {round(spearman_corr.statistic, 2)}, p = {round(spearman_corr.pvalue, 5)}')
+    axs.text(0, axs.get_ylim()[1],
+             f"Beta = {round(result.params['interstim_feature_params'], 2)}, p = {round(p_value, 5)}")
+
+
+    # boxplots correct
+    df = pd.DataFrame({'Similarity': intrastim_params, 'Separability': interstim_params})
+    plt.figure(figsize=(5, 5))
+    sns.violinplot(data=df, showmeans=True, showfliers=False, palette=['#FF928A', '#978EF5'], orient='v', inner=None)
+    sns.swarmplot(data=df, color=".25", size=2.5, orient='v')
+    plt.gca().axhline(0, ls='--', color='k')
+    plt.ylabel('\u03B2 (correct ~ condition)', fontsize=17)
+    # plt.xticks(plt.xticks()[0], plt.xticks()[1], rotation=90, va='center')
+    plt.tick_params(axis='y', labelsize=17)
+    plt.tick_params(axis='x', labelsize=17)
+
+    plt.scatter(0, np.mean(intrastim_params), color='w', edgecolor='k', lw=2, s=75, zorder=10)
+    plt.scatter(1, np.mean(interstim_params), color='w', edgecolor='k', lw=2, s=75, zorder=10)
+
+    for i, p in enumerate([list_of_pvalues[0], list_of_pvalues[2]]):
+        if p < 0.05:
+            # Get the position to place the star
+            x = i  # The x position corresponds to the box index
+            y = df.iloc[:, i].max() + 0.15  # Slightly above the max value of the box
+            plt.text(x, y, '*', ha='center', va='bottom', fontsize=20, fontweight='bold')
+    plt.tight_layout()
+
+    # boxplots
+    df = pd.DataFrame({'Similarity': intrastim_feature_params, 'Separability': regression_param_feature})
+    plt.figure(figsize=(5, 5))
+    sns.violinplot(data=df, showmeans=True, showfliers=False, palette=['#FF928A', '#978EF5'], orient='v', inner=None)
+    sns.swarmplot(data=df, color=".25", size=2.5, orient='v')
+    plt.gca().axhline(0, ls='--', color='k')
+    plt.ylabel('\u03B2 (condition ~ surprise)', fontsize=17)
+    # plt.yticks(plt.yticks()[0], plt.yticks()[1], rotation=90, va='center')
+    plt.tick_params(axis='y', labelsize=17)
+    plt.tick_params(axis='x', labelsize=17)
+
+    plt.scatter(0, np.mean(intrastim_feature_params), color='w', edgecolor='k', lw=2, s=75, zorder=10)
+    plt.scatter(1, np.mean(regression_param_feature), color='w', edgecolor='k', lw=2, s=75, zorder=10)
+
+    for i, p in enumerate([list_of_pvalues[1], list_of_pvalues[3]]):
+        if p < 0.05:
+            # Get the position to place the star
+            x = i  # The x position corresponds to the box index
+            y = df.iloc[:, i].max() + 0.15  # Slightly above the max value of the box
+            plt.text(x, y, '*', ha='center', va='bottom', fontsize=20, fontweight='bold')
+    plt.tight_layout()
+
+
+    plt.show()
 
 
 def full_representation_analysis_by_region(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=True, remove_outliers=False):
@@ -3670,15 +4637,15 @@ def representation_distance_and_correct_scatter(rms_path, behavior_path, similar
     # plt.plot(x_range, quadratic * x_range ** 2 + slope * x_range + intercept, color='b', label='quadratic fit')
 
     # exponential fit
-    popt, pcov = curve_fit(func, feature_full_list, interstim_distance_list)
-    # plt.plot(x_range, func(x_range, *popt), color='m', label='exp fit')
-    # compute AIC
-    resid = interstim_distance_list - func(feature_full_list, *popt)
-    N = len(interstim_distance_list)
-    k = len(popt)
-    sigma2 = np.sum(resid ** 2) / N
-    logL = -0.5 * N * (np.log(2 * np.pi * sigma2) + 1)
-    aic_exponential = 2 * k - 2 * logL
+    # popt, pcov = curve_fit(func, feature_full_list, interstim_distance_list)
+    # # plt.plot(x_range, func(x_range, *popt), color='m', label='exp fit')
+    # # compute AIC
+    # resid = interstim_distance_list - func(feature_full_list, *popt)
+    # N = len(interstim_distance_list)
+    # k = len(popt)
+    # sigma2 = np.sum(resid ** 2) / N
+    # logL = -0.5 * N * (np.log(2 * np.pi * sigma2) + 1)
+    # aic_exponential = 2 * k - 2 * logL
 
     plt.legend()
 
@@ -6149,6 +7116,358 @@ def regress_correct_on_suprise_and_neural_patterns(rms_path, behavior_path, simi
     plt.show()
 
 
+def _build_trial_channel_table(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=True, first_trials_to_remove=50):
+    """Long-format table with one row per (trial, channel) for all channels in `regions`.
+    Similarity (intrastimulus correlation of the 2 repetitions) and separability (mean distance to previous trials)
+    are z-scored within subject and channel. Surprise is z-scored within subject."""
+
+    behavior_all = pd.read_csv(behavior_path)
+    subject_paths = sorted(list(Path(rms_path).glob('*epochs_rms.pkl')))
+    del subject_paths[1]
+
+    selected_channels = {}
+    for subject_path in subject_paths:
+        subject_name = Path(subject_path).name[:6]
+        rms_obj = np.load(subject_path, allow_pickle=True)
+        parcellations = rms_obj['ch_parcellations']
+        if first_parcel_label == True:
+            parcellations = [[parcel[0]] for parcel in parcellations]
+        elif first_parcel_label == "advanced":
+            go_next = ['Unknown', 'ctx-rh-unknown', 'ctx-lh-unknown']
+            parcellations = select_parcel(parcellations, go_next)
+        selected_channels[subject_name] = [rms_obj['ch_names'][c] for c in range(len(rms_obj['ch_names']))
+                                           if any(ch_parcel in region for region in regions for ch_parcel in parcellations[c])]
+
+    stim_features = behavior_all[['stim_name', 'subject', condition, 'correct']]
+    data = np.load(similarity_path, allow_pickle=True)
+    distance_data = np.load(distance_path, allow_pickle=True)
+
+    def zscore(x):
+        return (x - x.mean(axis=0)) / x.std(axis=0)
+
+    tables = []
+    for s, subject in enumerate(data['subjects']):
+        if subject == 'Bou_Ni' or len(selected_channels.get(subject, [])) == 0:
+            continue
+        subject_stim_features = stim_features[stim_features['subject'] == subject].drop_duplicates('stim_name').set_index('stim_name')
+        ch_names = data['info'][s]['ch_names']
+        channel_idx = [c for c, name in enumerate(ch_names) if name in selected_channels[subject]]
+        if len(channel_idx) == 0:
+            continue
+        stim_names = list(data['stim_names'][s])
+        names_no_trial = [name[9:] for name in stim_names]
+        similarity_matrix = data['similarity_matrices'][s]
+        distance_matrix = distance_data['distance_matrices'][s]
+
+        indices_to_keep, correct_list, feature_list, stim_identity, intra = [], [], [], [], []
+        for i, stim in enumerate(stim_names):
+            if i <= first_trials_to_remove or stim not in subject_stim_features.index:
+                continue
+            row = subject_stim_features.loc[stim]
+            if np.isnan(row['correct']):
+                continue
+            if not ((stim[9:].replace('rep2', 'rep1') in names_no_trial) and (stim[9:].replace('rep1', 'rep2') in names_no_trial)):
+                continue
+            if 'rep1' in stim:
+                rep_index = names_no_trial.index(stim[9:].replace('rep1', 'rep2'))
+            elif 'rep2' in stim:
+                rep_index = names_no_trial.index(stim[9:].replace('rep2', 'rep1'))
+            else:
+                raise ValueError
+            indices_to_keep.append(i)
+            correct_list.append(row['correct'])
+            feature_list.append(row[condition])
+            stim_identity.append(stim[9:].replace('rep1', '').replace('rep2', ''))
+            intra.append(similarity_matrix[i, rep_index, :][channel_idx])
+
+        if len(indices_to_keep) < 10:
+            continue
+        intra = zscore(np.array(intra))
+        inter = np.zeros((len(indices_to_keep), len(channel_idx)))
+        for k, i in enumerate(indices_to_keep):
+            inter[k, :] = np.mean(distance_matrix[i, :i, :][:, channel_idx], axis=0)
+        inter = zscore(inter)
+
+        n_trials, n_channels = intra.shape
+        tables.append(pd.DataFrame({
+            'subject': subject,
+            'trial': np.repeat(np.arange(n_trials), n_channels),
+            'channel': np.tile([f'{subject}_{ch_names[c]}' for c in channel_idx], n_trials),
+            'stim_identity': np.repeat(stim_identity, n_channels),
+            'correct': np.repeat(np.array(correct_list, dtype=float), n_channels),
+            'surprise': np.repeat(zscore(np.array(feature_list, dtype=float)), n_channels),
+            'similarity': intra.ravel(),
+            'separability': inter.ravel(),
+        }))
+
+    df = pd.concat(tables, ignore_index=True).dropna()
+    df['trial_id'] = df['subject'] + '_' + df['trial'].astype(str)  # unique trial across subjects
+    df['surprise_sq'] = df['surprise'] ** 2
+    return df
+
+
+def _compare_full_vs_simple_mixed(df, random_slopes=True):
+    """Fit and compare (ML, likelihood ratio test) on a trial x channel table:
+        full:   correct ~ surprise + surprise^2 + similarity + separability + (1|subject) + (1|channel) + (1|stim_identity)
+                + random slopes of similarity and separability by channel
+        simple: correct ~ surprise + surprise^2 + (1|subject) + (1|channel) + (1|stim_identity)
+    Crossed effects are specified as variance components within a single group (linear probability model).
+    Random slopes are uncorrelated with each other (variance components)."""
+    df = df.copy()
+    df['all'] = 1
+    vc_simple = {'subject': '0 + C(subject)', 'channel': '0 + C(channel)', 'stim_identity': '0 + C(stim_identity)'}
+    vc_full = dict(vc_simple)
+    if random_slopes:
+        vc_full['sim_slope'] = '0 + C(channel):similarity'
+        vc_full['sep_slope'] = '0 + C(channel):separability'
+
+    def fit(formula, vc):
+        return MixedLM.from_formula(formula, groups='all', vc_formula=vc, re_formula='0', data=df).fit(reml=False, method='lbfgs')
+
+    full = fit('correct ~ surprise + surprise_sq + similarity + separability', vc_full)
+    simple = fit('correct ~ surprise + surprise_sq', vc_simple)
+
+    lr_stat = 2 * (full.llf - simple.llf)
+    ddof = len(full.fe_params) - len(simple.fe_params)
+    comparison = {'LR': lr_stat, 'df': ddof, 'p_LRT': scipy.stats.chi2.sf(lr_stat, ddof),
+                  'AIC_full': full.aic, 'AIC_simple': simple.aic, 'BIC_full': full.bic, 'BIC_simple': simple.bic}
+    return full, simple, comparison
+
+
+def _cluster_robust_check(df):
+    """Cluster-robust (by subject) OLS of the full model, as a sanity check on the mixed-model inference:
+    rows are repeated over channels so the effective sample size is the number of trials, not trial x channel."""
+    ols = sm.OLS(df['correct'], sm.add_constant(df[['surprise', 'surprise_sq', 'similarity', 'separability']])).fit(
+        cov_type='cluster', cov_kwds={'groups': pd.factorize(df['subject'])[0]})
+    return ols
+
+
+def _permutation_test_lr(df, n_permutations, seed=32, random_slopes=True):
+    """Null distribution of the LR statistic obtained by shuffling the neural values (similarity, separability)
+    across trials within each subject, identically for all channels (keeps the channel covariance structure)."""
+    rng = np.random.default_rng(seed)
+    wide_sim = df.pivot(index='trial_id', columns='channel', values='similarity')
+    wide_sep = df.pivot(index='trial_id', columns='channel', values='separability')
+    trial_subject = df.drop_duplicates('trial_id').set_index('trial_id')['subject']
+    null = []
+    for _ in tqdm(range(n_permutations)):
+        perm_map = {}
+        for subject, trials in trial_subject.groupby(trial_subject):
+            ids = trials.index.to_numpy()
+            perm_map.update(dict(zip(ids, rng.permutation(ids))))
+        permuted = df.copy()
+        source = df['trial_id'].map(perm_map)
+        keys = pd.MultiIndex.from_arrays([source, df['channel']])
+        permuted['similarity'] = wide_sim.stack().reindex(keys).to_numpy()
+        permuted['separability'] = wide_sep.stack().reindex(keys).to_numpy()
+        null.append(_compare_full_vs_simple_mixed(permuted, random_slopes)[2]['LR'])
+    return np.array(null)
+
+
+def trial_level_mixed_model_surprise_similarity_separability(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=True, first_trials_to_remove=50, random_slopes=True, n_permutations=0, save_csv_path=None):
+    """Channel x trial mixed model (option 1): all channels of the regions are kept, no averaging.
+        full:   correct ~ surprise + surprise^2 + similarity + separability + (1|subject) + (1|channel) + (1|stim_identity)
+                + (0 + similarity | channel) + (0 + separability | channel)
+        simple: correct ~ surprise + surprise^2 + (1|subject) + (1|channel) + (1|stim_identity)
+    Compared with a likelihood ratio test, AIC and BIC. Because rows are repeated across channels, inference is also
+    checked with subject-clustered robust errors and (optionally) a permutation null of the LR statistic obtained by
+    shuffling neural values across trials within subject.
+    Returns (table, full, simple, comparison)."""
+
+    df = _build_trial_channel_table(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label, first_trials_to_remove)
+    print(f'{len(df)} rows, {df["trial_id"].nunique()} trials, {df["channel"].nunique()} channels, '
+          f'{df["subject"].nunique()} subjects, {df["stim_identity"].nunique()} stimuli')
+
+    if save_csv_path is not None:
+        save_csv_path = Path(save_csv_path)
+        save_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        df[['subject', 'trial_id', 'channel', 'stim_identity', 'correct', 'surprise', 'similarity', 'separability']].to_csv(save_csv_path, index=False)
+        r_script = save_csv_path.with_suffix('.R')
+        r_script.write_text(
+            'library(lme4)\n'
+            f'df <- read.csv("{save_csv_path.name}")\n'
+            'df$correct <- as.integer(df$correct)\n'
+            'df$subject <- factor(df$subject); df$channel <- factor(df$channel); df$stim_identity <- factor(df$stim_identity)\n'
+            'ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))\n'
+            '# channel labels are already unique across subjects, so (1|channel) is nested within subject\n'
+            'simple <- glmer(correct ~ surprise + I(surprise^2) + (1|subject) + (1|channel) + (1|stim_identity),\n'
+            '                data = df, family = binomial, control = ctrl)\n'
+            'full <- glmer(correct ~ surprise + I(surprise^2) + similarity + separability +\n'
+            '              (1|subject) + (1|channel) + (1|stim_identity),\n'
+            '              data = df, family = binomial, control = ctrl)\n'
+            '# with random slopes (may not converge):\n'
+            '# full_slopes <- glmer(correct ~ surprise + I(surprise^2) + similarity + separability +\n'
+            '#   (1|subject) + (1|channel) + (1|stim_identity) + (0 + similarity|channel) + (0 + separability|channel),\n'
+            '#   data = df, family = binomial, control = ctrl)\n'
+            'summary(simple); summary(full)\n'
+            'anova(simple, full)\n')
+        print(f'Saved table to {save_csv_path} and R script to {r_script}')
+
+    full, simple, comparison = _compare_full_vs_simple_mixed(df, random_slopes)
+    print(full.summary())
+    print(full.pvalues)
+    print(simple.summary())
+    print(simple.pvalues)
+    print(f'LRT full vs simple: chi2({comparison["df"]}) = {comparison["LR"]}, p = {comparison["p_LRT"]}')
+    print(f'AIC full = {comparison["AIC_full"]:.2f}, simple = {comparison["AIC_simple"]:.2f}; '
+          f'BIC full = {comparison["BIC_full"]:.2f}, simple = {comparison["BIC_simple"]:.2f}')
+
+    print(_cluster_robust_check(df).summary().tables[1])
+
+    if n_permutations > 0:
+        null = _permutation_test_lr(df, n_permutations, random_slopes=random_slopes)
+        comparison['p_permutation'] = (np.sum(null >= comparison['LR']) + 1) / (n_permutations + 1)
+        print(f'Permutation p (LR statistic) = {comparison["p_permutation"]:.4f}')
+
+    return df, full, simple, comparison
+
+
+def _fit_bayes_glmm(df, predictors, random_slopes=True):
+    """Binomial mixed GLMM (logit link) fitted by variational Bayes. Random intercepts: subject, channel, stim_identity;
+    optional independent random slopes by channel for 'similarity' and 'separability' when they are in `predictors`."""
+    vc = {'subject': '0 + C(subject)', 'channel': '0 + C(channel)', 'stim_identity': '0 + C(stim_identity)'}
+    if random_slopes:
+        for name in ['similarity', 'separability']:
+            if name in predictors:
+                vc[f'{name}_slope'] = f'0 + C(channel):{name}'
+    formula = 'correct ~ ' + ' + '.join(predictors)
+    model = BinomialBayesMixedGLM.from_formula(formula, vc, df.reset_index(drop=True))
+    return model.fit_vb()
+
+
+def _bayes_fixed_effects_table(result):
+    """Posterior mean, sd and approximate 95% credible interval of the fixed effects (log-odds)."""
+    names = result.model.exog_names
+    mean, sd = np.asarray(result.fe_mean), np.asarray(result.fe_sd)
+    return pd.DataFrame({'mean': mean, 'sd': sd, 'ci_low': mean - 1.96 * sd, 'ci_high': mean + 1.96 * sd,
+                         'P(coef>0)': scipy.stats.norm.cdf(mean / sd)}, index=names)
+
+
+def _bayes_cross_validated_comparison(df, full_predictors, simple_predictors, n_folds=5, seed=32, random_slopes=True):
+    """Grouped K-fold cross-validation (all channels of a trial stay in the same fold) of the held-out log predictive
+    density using population-level (fixed effect) predictions. Returns per-trial elpd arrays for both models."""
+    rng = np.random.default_rng(seed)
+    trial_ids = df['trial_id'].unique()
+    fold_of_trial = dict(zip(trial_ids, rng.permutation(len(trial_ids)) % n_folds))
+    folds = df['trial_id'].map(fold_of_trial).to_numpy()
+
+    elpd = {'full': np.zeros(len(df)), 'simple': np.zeros(len(df))}
+    for fold in range(n_folds):
+        train, test = df[folds != fold], df[folds == fold]
+        for key, predictors in [('full', full_predictors), ('simple', simple_predictors)]:
+            res = _fit_bayes_glmm(train, predictors, random_slopes)
+            beta = np.asarray(res.fe_mean)
+            X = np.column_stack([np.ones(len(test))] + [test[p].to_numpy() for p in predictors])
+            p = np.clip(scipy.special.expit(X @ beta), 1e-6, 1 - 1e-6)
+            y = test['correct'].to_numpy()
+            elpd[key][folds == fold] = y * np.log(p) + (1 - y) * np.log(1 - p)
+
+    # average over channels within trial so that the unit of comparison is the trial
+    per_trial = {k: pd.Series(v).groupby(df['trial_id'].to_numpy()).mean() for k, v in elpd.items()}
+    return per_trial['full'], per_trial['simple']
+
+
+def trial_level_bayesian_glmm_surprise_similarity_separability(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=True, first_trials_to_remove=50, random_slopes=True, n_folds=5, seed=32, df=None):
+    """Binomial (logit) Bayesian mixed GLMM version of trial_level_mixed_model_surprise_similarity_separability.
+        full:   correct ~ surprise + surprise^2 + similarity + separability + (1|subject) + (1|channel) + (1|stim_identity)
+                + independent random slopes of similarity and separability by channel
+        simple: correct ~ surprise + surprise^2 + (1|subject) + (1|channel) + (1|stim_identity)
+    Fitted by variational Bayes (statsmodels BinomialBayesMixedGLM), which gives no likelihood: models are compared by
+    grouped cross-validated log predictive density (elpd, higher is better) on held-out trials, with a paired standard
+    error over trials. A pre-built table can be passed with `df` to skip data loading.
+    Returns (table, full result, simple result, comparison dict, fixed effects tables)."""
+
+    if df is None:
+        df = _build_trial_channel_table(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label, first_trials_to_remove)
+    print(f'{len(df)} rows, {df["trial_id"].nunique()} trials, {df["channel"].nunique()} channels, '
+          f'{df["subject"].nunique()} subjects, {df["stim_identity"].nunique()} stimuli')
+
+    full_predictors = ['surprise', 'surprise_sq', 'similarity', 'separability']
+    simple_predictors = ['surprise', 'surprise_sq']
+    full = _fit_bayes_glmm(df, full_predictors, random_slopes)
+    simple = _fit_bayes_glmm(df, simple_predictors, random_slopes)
+    fixed = {'full': _bayes_fixed_effects_table(full), 'simple': _bayes_fixed_effects_table(simple)}
+    print('Full model fixed effects (log-odds):\n', fixed['full'])
+    print('Simple model fixed effects (log-odds):\n', fixed['simple'])
+
+    elpd_full, elpd_simple = _bayes_cross_validated_comparison(df, full_predictors, simple_predictors, n_folds, seed, random_slopes)
+    diff = (elpd_full - elpd_simple).to_numpy()
+    comparison = {'elpd_full_per_trial': elpd_full.mean(), 'elpd_simple_per_trial': elpd_simple.mean(),
+                  'elpd_diff_total': diff.sum(), 'elpd_diff_se': np.sqrt(len(diff)) * diff.std(ddof=1)}
+    print(f'Cross-validated elpd (full - simple) = {comparison["elpd_diff_total"]:.2f} +/- {comparison["elpd_diff_se"]:.2f} '
+          f'({len(diff)} trials); positive favours the full model, > 2 SE is convincing')
+
+    return df, full, simple, comparison, fixed
+
+
+def trial_level_mixed_model_selected_channels(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=True, first_trials_to_remove=50, r2_threshold=0.05, n_folds=2, random_slopes=True, n_permutations=0, seed=32):
+    """Same model as trial_level_mixed_model_surprise_similarity_separability, restricted to channels whose
+    similarity or separability follows surprise (option 2), with cross-fitted (non-circular) channel selection.
+    Trials of each subject are split in `n_folds`; channels are selected on the other folds
+    (exponential fit of similarity/separability ~ surprise, R² > r2_threshold, similarity decreasing and
+    separability increasing with surprise, as in the dual-mechanism analysis) and only used to build the rows of
+    the held-out fold. Selection never uses `correct` and never uses the trials it is evaluated on.
+    Returns (table, full, simple, comparison, selection)."""
+
+    df = _build_trial_channel_table(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label, first_trials_to_remove)
+    rng = np.random.default_rng(seed)
+
+    def exp_func(x, a, b, c):
+        return a * np.exp(b * x) + c
+
+    def exp_fit(x, y):
+        """returns (R², b) or (nan, nan) if the fit fails"""
+        try:
+            popt, _ = curve_fit(exp_func, x, y, p0=[1, 0, 0], bounds=([0, -np.inf, -np.inf], [np.inf, np.inf, np.inf]), maxfev=100000)
+        except (RuntimeError, ValueError):
+            return np.nan, np.nan
+        ss_tot = np.sum((y - y.mean()) ** 2)
+        return 1 - np.sum((exp_func(x, *popt) - y) ** 2) / ss_tot, popt[1], popt[1]
+
+    # assign each trial of a subject to a fold
+    trials = df.drop_duplicates('trial_id')[['trial_id', 'subject']]
+    fold_of_trial = {}
+    for subject, sub_trials in trials.groupby('subject'):
+        folds = rng.permutation(np.arange(len(sub_trials)) % n_folds)
+        fold_of_trial.update(dict(zip(sub_trials['trial_id'], folds)))
+    df['fold'] = df['trial_id'].map(fold_of_trial)
+
+    kept = []
+    selection = []
+    for channel, ch_df in df.groupby('channel'):
+        for fold in range(n_folds):
+            train = ch_df[ch_df['fold'] != fold]
+            r2_intra, b_intra = exp_fit(train['surprise'].to_numpy(), train['similarity'].to_numpy())
+            r2_inter, b_inter = exp_fit(train['surprise'].to_numpy(), train['separability'].to_numpy())
+            selected = ((r2_intra > r2_threshold) and (b_intra < 0)) or ((r2_inter > r2_threshold) and (b_inter > 0))
+            selection.append({'channel': channel, 'held_out_fold': fold, 'r2_similarity': r2_intra, 'b_similarity': b_intra,
+                              'r2_separability': r2_inter, 'b_separability': b_inter, 'selected': selected})
+            if selected:
+                kept.append(ch_df[ch_df['fold'] == fold])
+    selection = pd.DataFrame(selection)
+    print(f'{selection["selected"].mean() * 100:.1f}% of (channel, fold) selections kept')
+    if len(kept) == 0:
+        raise ValueError('No channel passed the selection criterion')
+    selected_df = pd.concat(kept, ignore_index=True)
+    print(f'{len(selected_df)} rows, {selected_df["trial_id"].nunique()} trials, {selected_df["channel"].nunique()} channels, '
+          f'{selected_df["subject"].nunique()} subjects')
+
+    full, simple, comparison = _compare_full_vs_simple_mixed(selected_df, random_slopes)
+    print(full.summary())
+    print(simple.summary())
+    print(f'LRT full vs simple: chi2({comparison["df"]}) = {comparison["LR"]:.3f}, p = {comparison["p_LRT"]:.5f}')
+    print(f'AIC full = {comparison["AIC_full"]:.2f}, simple = {comparison["AIC_simple"]:.2f}; '
+          f'BIC full = {comparison["BIC_full"]:.2f}, simple = {comparison["BIC_simple"]:.2f}')
+    print(_cluster_robust_check(selected_df).summary().tables[1])
+
+    if n_permutations > 0:
+        null = _permutation_test_lr(selected_df, n_permutations, seed=seed, random_slopes=random_slopes)
+        comparison['p_permutation'] = (np.sum(null >= comparison['LR']) + 1) / (n_permutations + 1)
+        print(f'Permutation p (LR statistic) = {comparison["p_permutation"]:.4f}')
+
+    return selected_df, full, simple, comparison, selection
+
+
 def linear_vs_exp_by_region(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=True):
     """Fit similarity ~ surprise and separability ~ surprise with linear and exponential functions per channel.
     Not threshold on R², every channel is tested.
@@ -8187,6 +9506,16 @@ if __name__ == '__main__':
     # data_path = '/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/similarity_matrix_prefrontal.pkl'
     # repetition_dissimilarity_and_correct_seeg(data_path, stim_features_csv)
 
+    '''save_distance_matrix_seeg'''
+    data_path = '/home/mathieu/These/data/meg_maestro/seeg_trials'
+    save_path = '/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/dtw_distances/normalization_control'
+    regions = ['ctx-lh-middletemporal', 'ctx-rh-middletemporal', 'Left-Hippocampus',
+                   'Left-Amygdala', 'ctx-lh-parahippocampal', 'ctx-lh-temporalpole', 'ctx-lh-inferiortemporal',
+                   'ctx-lh-entorhinal', 'Right-Hippocampus', 'Right-Amygdala', 'ctx-rh-parahippocampal',
+                   'ctx-rh-inferiortemporal']  # regions of temporal lobe that show a power contrast
+    normalize = True
+    # save_distance_matrix_seeg(data_path, save_path, regions=regions, normalize=normalize, n_jobs=-1)
+
     '''full_representation_analysis_seeg'''
     rms_path = '/home/mathieu/These/data/meg_maestro/pac_analysis/seeg/epochs_rms_all_channels'
     behavior_path = '/home/mathieu/These/data/meg_maestro/behavior_analysis/seeg_behavior/behavior_seeg_data_matrix.csv'
@@ -8239,7 +9568,10 @@ if __name__ == '__main__':
     #            'ctx-rh-rostralmiddlefrontal', 'ctx-rh-caudalmiddlefrontal', 'ctx-rh-parstriangularis', 'ctx-rh-parsopercularis', 'ctx-rh-parsorbitalis', 'ctx-rh-lateralorbitofrontal']  # prefrontal
     similarity_path = '/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/similarity_matrix_all_electrodes.pkl'
     distance_path = '/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/dtw_distances/dtw_distance_matrix.pkl'
+    # distance_path = '/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/dtw_distances/normalization_control/dtw_distance_matrix.pkl'
     # full_representation_analysis_seeg(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label, permutations=0)
+    # full_representation_analysis_seeg_rms_control(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label, permutations=0)
+    full_representation_analysis_seeg_mixed_model(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label, first_trials_to_remove=50, save_folder='/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/r_analysis')
 
     '''save_full_representation_stat_individual_electrode'''
     save_path = '/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/corr_and_distance'
@@ -8248,6 +9580,7 @@ if __name__ == '__main__':
     '''representation_distance_and_correct_scatter'''
     similarity_path = '/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/similarity_matrix_all_electrodes.pkl'
     distance_path = '/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/dtw_distances/dtw_distance_matrix.pkl'
+    # distance_path = '/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/dtw_distances/normalization_control/dtw_distance_matrix.pkl'
     # representation_distance_and_correct_scatter(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
 
     # representation_distance_distributions(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
@@ -8260,7 +9593,7 @@ if __name__ == '__main__':
     # impact_of_first_trials_to_remove(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
 
     '''full_dual_mechanism_model'''
-    full_dual_mechanism_model(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
+    # full_dual_mechanism_model(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
     # full_dual_mechanism_model_R2_threshold_impact(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
     # full_dual_mechanism_model_linear_exp_comparison(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
     # full_dual_mechanism_model_separated_channels(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label, channel_selection='weight')
@@ -8268,6 +9601,11 @@ if __name__ == '__main__':
 
     '''regress_correct_on_suprise_and_neural_patterns'''
     # regress_correct_on_suprise_and_neural_patterns(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label)
+
+    '''trial_level_mixed_model_surprise_similarity_separability'''
+    # trial_level_mixed_model_surprise_similarity_separability(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label, first_trials_to_remove=50, random_slopes=False, n_permutations=0, save_csv_path='/home/mathieu/These/data/meg_maestro/representation_analysis/seeg/r_analysis/trial_level_mixed_model_surprise_similarity_separability.csv')
+    # trial_level_mixed_model_selected_channels(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label, first_trials_to_remove=50, r2_threshold=0.05, n_folds=2, random_slopes=False, n_permutations=0, seed=32)
+    # trial_level_bayesian_glmm_surprise_similarity_separability(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label=first_parcel_label, first_trials_to_remove=50, random_slopes=False, n_folds=5, seed=32, df=None)
 
     '''linear_vs_exp_by_region'''
     regions = ['ctx-lh-transversetemporal', 'ctx-lh-superiortemporal', 'ctx-rh-transversetemporal',
@@ -8304,7 +9642,7 @@ if __name__ == '__main__':
                'Left-Amygdala', 'ctx-lh-parahippocampal', 'ctx-lh-temporalpole', 'ctx-lh-inferiortemporal',
                'ctx-lh-entorhinal', 'Right-Hippocampus', 'Right-Amygdala', 'ctx-rh-parahippocampal',
                'ctx-rh-inferiortemporal']  # regions of temporal lobe that show a power contrast
-    full_representation_analysis_by_region(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label='advanced', remove_outliers=True)
+    # full_representation_analysis_by_region(rms_path, behavior_path, similarity_path, distance_path, condition, regions, first_parcel_label='advanced', remove_outliers=True)
 
     '''representation_analysis_windows_seeg'''
     rms_path = '/home/mathieu/These/data/meg_maestro/pac_analysis/seeg/epochs_rms_all_channels'
